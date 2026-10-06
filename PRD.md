@@ -40,17 +40,19 @@
 4. **缺乏全球实体对齐与语言标注**：豆瓣的「又名」未标注语言（简/繁/粤/英/日/韩）；缺乏国际公认唯一标识（Wikidata QID、IMDb tt、Steam AppID、ISBN、MusicBrainz MBID），限制了向分布式社交网络与第三方平台的迁移质量。
 
 ### 0.3 核心设计铁律 (Architectural Invariants)
-本仓库的架构与工程设计必须无条件恪守以下五条铁律：
+本仓库的架构与工程设计必须无条件恪守以下六条铁律：
 
 1. **客观事实与派生缓存分离 (Immutable Facts vs. Derived Cache)**  
    WARC 原始捕获与用户标记是不可撼动的客观事实；`canonical` 是客观观测事件日志。Enricher 产出的所有外部 ID、推断元数据及恢复信息**纯属衍生缓存（Derived Cache）**。清空 Enricher 产出，整个系统依靠原始捕获依然能离线全量构建。
 2. **和 Bundle 一样可独立备份、可完整带走 (First-Class Portability)**  
    Enricher 的产物绝不能是散落于本机 scratchpad 的临时缓存，而必须是一个**独立自包含、有版本清单、可打包压缩带走（Portable）、可离线冷备的一等公民归档包 (`doubak-enrichment-<id>`)**。无论是拷贝至 U 盘还是备份至 NAS，十几年后解压依然立即可用。
-3. **绝不允许主观手填元数据，一切增强必须基于可信证据链 (No Manual Metadata Injection)**  
+3. **条目丢失优先处理与渐进式固化 (Lost-First Priority & Progressive Commit)**  
+   外部知识库接口均有严格限流与速率控制。系统绝不盲目线性遍历几千条作品，而是**强制实行优先级队列**：优先调度上游已删除的墓碑条目与残缺条目，且 P0 墓碑处理完毕后立即固化落盘。即便任务中途因网络中断或被用户终止，最关键的丢失条目已经成功恢复。
+4. **绝不允许主观手填元数据，一切增强必须基于可信证据链 (No Manual Metadata Injection)**  
    严禁提供主观手工篡改标题、海报、年份等元数据的后门。手填元数据不仅无法保证真实性，还会引入不可维护的第二混乱真相源。Enricher 的所有数据补充，**必须来自有据可查、可重复验证的公开源**（历史抓取快照、Wayback Machine、Wikidata、Steam、TMDB、Bangumi 等），所有原始网络报文完整存入包内的标准 WARC 文件中封存。
-4. **构建与渲染阶段绝不发起网络请求 (Zero Network at Build/Render Time)**  
+5. **构建与渲染阶段绝不发起网络请求 (Zero Network at Build/Render Time)**  
    Enricher 是整个流水线中**唯一**被允许发起外部网络请求的组件。一旦抓取完成，所有关联结果及网络原始响应必须**固化落盘在包内**。静态站点生成（`site-generator`）与向第三方导出（`export-adapters`）必须永远保持 100% 离线运行。
-5. **极简审计性与零运行时依赖 (Zero Runtime Dependencies)**  
+6. **极简审计性与零运行时依赖 (Zero Runtime Dependencies)**  
    遵循 Doubak monorepo 统一工具链：Node ≥ 20，纯原生 ES 模块（ESM），JSDoc 类型标注，`node:test` 单测框架，零第三方 npm 运行时依赖，零构建步骤。
 
 ---
@@ -99,32 +101,65 @@
 
 ## 2. 系统功能规范 (Functional Specifications)
 
-`doubak-data-enricher` 拒绝任何形式的主观手工编造数据，所有能力均基于**确定性的机器规则、可信凭证与证据链**。系统分为四大核心模块：
+`doubak-data-enricher` 拒绝任何形式的主观手工编造数据，所有能力均基于**确定性的机器规则、可信凭证与证据链**。系统分为五大核心模块：
 
 ```
                     ┌────────────────────────────────────────────────────────┐
                     │                 doubak-data-enricher                   │
                     └────────────────────────────────────────────────────────┘
                                                  │
-         ┌───────────────────┬───────────────────┴───────────────────┬───────────────────┐
-         ▼                   ▼                                       ▼                   ▼
-┌─────────────────┐ ┌─────────────────┐                     ┌─────────────────┐ ┌─────────────────┐
-│ 1. 墓碑证据恢复 │ │ 2. 实体证据对齐 │                     │ 3. 元信息提取器 │ │ 4. 语言标记器   │
-│ (Tombstone Rec) │ │ (Entity Align)  │                     │ (RawMeta Parser)│ │ (Lang Tagging)  │
-└─────────────────┘ └─────────────────┘                     └─────────────────┘ └─────────────────┘
-  ├─ 历史抓取快照比对 ├─ 全球唯一标识 (Steam/IMDb)            ├─ 封闭词典比对     ├─ Unicode 字符集判定
-  ├─ Wayback CDX API  ├─ 页面关键词与又名交叉验证            ├─ 格式模式匹配     ├─ 简繁粤英归类
-  ├─ Wikidata SPARQL  └─ 用户上下文证据对齐                  ├─ #info 表格比对   └─ BCP 47 编码标注
-  └─ 垂直数据库精确匹配                                      └─ 置信度加权打分
+         ┌───────────────────┬───────────────────┼───────────────────┬───────────────────┐
+         ▼                   ▼                   ▼                   ▼                   ▼
+┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
+│ 1. 丢失优先调度 │ │ 2. 墓碑证据恢复 │ │ 3. 实体证据对齐 │ │ 4. 元信息提取器 │ │ 5. 语言标记器   │
+│ (Priority Queue)│ │ (Tombstone Rec) │ │ (Entity Align)  │ │ (RawMeta Parser)│ │ (Lang Tagging)  │
+└─────────────────┘ └─────────────────┘ └─────────────────┘ └─────────────────┘ └─────────────────┘
+  ├─ P0~P4 分级评估   ├─ 历史快照比对     ├─ 全球唯一标识对齐 ├─ 封闭词典比对     ├─ Unicode 字符集
+  ├─ 渐进式提前落盘   ├─ Wayback CDX API  ├─ 页面关键词佐证   ├─ 格式模式匹配     ├─ 简繁粤英归类
+  └─ --only-lost 参数 └─ Wikidata / Steam └─ 用户上下文佐证   └─ #info 表格比对   └─ BCP 47 编码标注
 ```
 
 ---
 
-### 2.1 模块一：墓碑证据恢复引擎 (Tombstone Recovery Engine)
+### 2.1 模块一：条目丢失优先的排队调度系统 (Priority Scheduling System)
 
-针对 `upstream_deleted === true`（`title === null`）的墓碑条目，必须通过**客观凭证链**找回真实元数据，拒绝任何“凭空捏造”：
+一个真实用户的个人归档往往包含数千条（如本例 2984 条）甚至上万条作品。外部公共知识库（Wikidata SPARQL、Wayback Machine、Steam）均有严苛的速率限制与反爬防风控机制（通常需间隔 1.5 秒以上）。如果按物理文件行序盲目线性遍历，处理全量归档需要数十分钟甚至数小时。
 
-#### 2.1.1 凭证链恢复流水线
+然而，在这数千部作品中，**用户感知最剧烈、数据损坏最严重的，恰恰是那不到 1% 的上游丢失条目（当前仅 8 部）！** 健康存活的条目，静态站点原本就能正常显示标题与介绍；只有丢失条目才会沦为刺眼的“未知作品”，并在导出 NeoDB 时被直接丢弃。
+
+因此，系统建立**五级优先级评估与调度模型 (P0 ~ P4)**：
+
+#### 2.1.1 五级优先级队列模型
+
+| 优先级 | 判定条件 | 核心抢救目标 | 数量占比 | 执行时机与策略 |
+|---|---|---|---|---|
+| **P0（致命级）<br>墓碑与丢失条目** | `upstream_deleted === true` 或 `title === null` 或 `url === null` | 优先通过 Wayback、Wikidata、Steam 抢救恢复真实标题、封面与全球 ID，避免在导出时被丢弃 | ~0.3%<br>(当前 8 部) | **最先执行**。通常仅需 3~5 秒即可全部完成，处理完毕后**立即固化落盘**。 |
+| **P1（结构级）<br>疑似删除重建条目** | 新条目 keywords 载有旧条目名、或用户短评显式指出更名重现、或命中同一外部唯一 ID | 优先生成 `entities.ndjson` 聚合映射，打通跨 ID 断裂的历史时间线 | ~0.5% | P0 之后立即执行，确立核心作品聚类实体。 |
+| **P2（残缺级）<br>关键展示项缺失** | 存活正常，但缺少海报（占位图）、或缺少详情页 `#info`、或影视缺少 IMDb 编号、或图书缺少 ISBN | 补齐 IMDb/ISBN 与高清海报，提升向 Letterboxd / Goodreads 导出的成功率 | ~2.0% | 第二阶段执行，集中修复影响外部平台导出的短板。 |
+| **P3（创作级）<br>用户心血活跃条目** | 存活正常，但用户撰写了长文日记（`longform.ndjson`）、评语大于 100 字、多次打星或广播互动 | 优先为其提取结构化 `raw_meta`，丰富作品页详情呈现 | ~15.0% | 第三阶段执行，优先服务用户倾注心血最多的作品。 |
+| **P4（闲时级）<br>常规普通条目** | 存活正常、元数据完整、仅点选“看过”且无独立评语 | 纯本地 CPU 跑 `raw_meta` 启发式提取与语言标注，不耗费外部 API 额度 | ~82.0% | 最末执行。可在后台批处理或增量闲时运行。 |
+
+#### 2.1.2 渐进式提前落盘 (Progressive Early Commit)
+* 当 P0（墓碑丢失条目）与 P1（对齐条目）处理完毕后，调度器**立即触发首次归档固化**：将恢复出的数据生成第一批 NDJSON 记录，并将网络凭证段写入 WARC 文件。
+* **容错价值**：即便全量任务在处理后续 P3/P4 过程中遭遇网络波动、API 配额耗尽或被用户手动中断（Ctrl+C），**最重要的墓碑数据已经 100% 挽救落盘**，产出的归档包已经可以直接供下游建站与导出使用！
+
+#### 2.1.3 CLI 快速拯救模式
+提供细粒度 CLI 参数控制：
+```sh
+# 极速拯救模式：只扫描和抢救 P0（丢失条目），3~5 秒内完成并产出归档包
+doubak-enrich <canonical> [out] --only-lost
+
+# 针对性处理高优先级队列（P0 + P1 + P2）
+doubak-enrich <canonical> [out] --priority=P0,P1,P2
+```
+
+---
+
+### 2.2 模块二：墓碑证据恢复引擎 (Tombstone Recovery Engine)
+
+针对 P0 墓碑条目，必须通过**客观凭证链**找回真实元数据，拒绝任何“凭空捏造”：
+
+#### 2.2.1 凭证链恢复流水线
 
 1. **Tier 1: 本地跨版本/历史快照回溯 (Local Archive Traceback)**  
    * **原理**：检查本地历史所有 bundle 中，是否在该条目被删除前曾抓到过其详情页。  
@@ -151,11 +186,11 @@
 
 ---
 
-### 2.2 模块二：基于证据的实体对齐与条目合并 (Evidence-based Entity Alignment)
+### 2.3 模块三：基于证据的实体对齐与条目合并 (Evidence-based Entity Alignment)
 
 针对豆瓣上游“删除后换 ID 重建”的问题，Enricher 建立独立的实体对齐层，**不修改 canonical 历史，而是在上层产出聚合映射 (`entities.ndjson`)**。
 
-#### 2.2.1 自动对齐的四大证据准则 (Zero-Guesswork Alignment Rules)
+#### 2.3.1 自动对齐的四大证据准则 (Zero-Guesswork Alignment Rules)
 为了杜绝误合并，两个豆瓣条目（如 `37364867` 与 `33375066`）被判定为同一现实作品，必须满足以下**至少一条可信证据**：
 
 1. **证据 A：外部全球唯一标识一致（Strong External ID Identity）**  
@@ -168,7 +203,7 @@
 4. **证据 D：用户第一人称言论的上下文佐证（User Mark Semantic Evidence）**  
    * 当用户在新条目的标记评语中明确陈述：“*我很确定以前还叫《情感反诈模拟器》的时候就标记过，豆瓣删条目又重建条目了*”，系统通过命名实体与时间轴比对，将此作为辅助判定凭证。
 
-#### 2.2.2 实体对齐产物模型 (`entities.ndjson`)
+#### 2.3.2 实体对齐产物模型 (`entities.ndjson`)
 当对齐成立时，生成规范实体记录：
 
 ```jsonc
@@ -205,11 +240,11 @@
 
 ---
 
-### 2.3 模块三：元信息结构化提取 (`raw_meta` Parser)
+### 2.4 模块四：元信息结构化提取 (`raw_meta` Parser)
 
 根据 `canonical/FIELDS.md` §4，列表页提取的 `intro` / `pub` / `desc` 是未分拆的纯文本字符串。Enricher 承担这层有损但高价值的推断工作。
 
-#### 2.3.1 跨媒介提取模式库
+#### 2.4.1 跨媒介提取模式库
 
 | 媒介 | 真实字符串示例 | 提取目标字段 | 提取判据与启发式 |
 |---|---|---|---|
@@ -218,7 +253,7 @@
 | **音乐 (`intro`)**| `星野源 / 2016-10-05 / Limited Edition / CD / 流行` | `artists`, `release_date`, `edition`, `media_format`, `genres` | 介质字典 (`CD\|Vinyl\|LP\|数字`)；日期提取；流派词典 (`流行\|摇滚\|民谣\|爵士`)。 |
 | **影视 (`intro`)**| `2026-01-23(美国/中国大陆) / 杰瑞米·艾文 / ... / 103分钟 / 悬疑 / 英语` | `release_date`, `regions`, `cast`, `runtime_minutes`, `genres`, `languages` | 正则识别时长 (`\d+分钟`)；全球国家/地区词典；ISO 语言词典；首位上映日提取。 |
 
-#### 2.3.2 交叉验证与自校验
+#### 2.4.2 交叉验证与自校验
 * 如果条目本身拥有详情页捕获的 `#info`（原生携带中文标签）：
   * 提取器会将 `raw_meta` 的提取结果与 `#info` 逐项交叉比对；
   * 比对一致的项，置信度标记为 `1.0`；
@@ -226,11 +261,11 @@
 
 ---
 
-### 2.4 模块四：语言与别名智能标注 (Language & Alias Tagging)
+### 2.5 模块五：语言与别名智能标注 (Language & Alias Tagging)
 
 CLAUDE.md 明确定规：“*The parser must not guess a language tag. Douban's 又名 list mixes Cantonese, Taiwanese, English and transliterations untagged. Write `lang: null`. Language detection is enrichment, gets `source: 'detected'` plus a confidence, and can be re-run.*”
 
-#### 2.4.1 零依赖轻量语言检测器
+#### 2.5.1 零依赖轻量语言检测器
 在不引入庞大 NLP 依赖的前提下，利用 Unicode 字符区间与特定词汇特征实现高精度判定：
 1. **纯 ASCII / 罗马字符**：判定为 `en` 或原文语言。
 2. **日文假名（平假名 `\u3040-\u309F` / 片假名 `\u30A0-\u30FF`）**：判定为 `ja`。
@@ -361,23 +396,23 @@ doubak-enrichment-<enrichment_id>/
 | 规范目录 | 写入方 | 生命周期 | 核心使命 |
 |---|---|---|---|
 | `bundle/` | 抓取工具与导入器 | 用户抓取完成后即**永久冻结** | 忠实记录不可逆的抓取行为与原始字节 |
-| `canonical/` | 解析器 | **随时可迭代演进**（重跑成本极低） | 从 WARC 提取纯粹的客观观测事件日志 |
-| **`enrichment/`** | **数据关联器** | **随时可按需重跑、可独立打包备份** | **建立跨平台实体对齐映射与外部知识关联** |
+| `canonical/` | 解析器 | **随时可迭代演进** | 从 WARC 提取纯粹的客观观测事件日志 |
+| **`enrichment/`** | **数据关联器** | **可按需重跑、可独立打包备份** | **建立跨平台实体对齐映射与外部知识关联** |
 
 * **规范文件落地**：
   * `enrichment/README.md` —— 规范树入口与设计哲学；
   * `enrichment/v1/SPEC.md` —— 归档包目录布局、校验和算法、字段定义与时间戳语义；
   * JSON Schema 集合：
-    * `manifest.schema.json`（定义 `spec_version: "enrichment/1.0"`）
-    * `subject-enriched.schema.json`（定义增强字段、来源与置信度模式）
-    * `entity.schema.json`（定义实体的成员集合与 `same_as` 映射）
+    * `manifest.schema.json`（定义 `spec_version: "enrichment/1.0"`）；
+    * `subject-enriched.schema.json`（定义增强字段、证据来源与置信度）；
+    * `entity.schema.json`（定义实体成员与 `same_as` 映射）；
   * 词表注册表：
-    * `vocabularies/enrichment-source.json`（枚举来源白名单：`local_archive`, `wayback`, `wikidata`, `steam`, `tmdb`, `heuristic_v1` 等）
-    * `vocabularies/alignment-rule.json`（枚举对齐规则：`external_id_match`, `keyword_match`, `short_url_closure` 等）
-  * 零依赖校验器：`enrichment/v1/validate.py <归档包路径>`（验证结构与哈希完整性）。
+    * `vocabularies/enrichment-source.json`（白名单枚举：`local_archive`, `wayback`, `wikidata`, `steam`, `tmdb` 等）；
+    * `vocabularies/alignment-rule.json`（对齐规则枚举：`external_id_match`, `keyword_match` 等）；
+  * 零依赖校验器：`enrichment/v1/validate.py <归档包路径>`。
 
-### 4.2 `bundle/v1/` 规范的兼容性扩展
-为了保证 `doubak-enrichment-<id>` 内部凭证段使用的 `data-*.warc.gz` 与 `index-*.ndjson` 能被现有的 `bundle/v1/validate.py` 校验器 100% 兼容识别，需要在 `bundle/v1/vocabularies/intent.json` 中追加注册 Enricher 的意图列表：
+### 4.2 `bundle/v1/` 词表的兼容性扩展
+为了让 `doubak-enrichment-<id>` 内部凭证段使用的 `data-*.warc.gz` 与 `index-*.ndjson` 能够**直接通过现有 `bundle/v1/validate.py` 的校验**，需要在 `bundle/v1/vocabularies/intent.json` 中追加注册 Enricher 的意图：
 
 * `enrichment.tombstone.wayback_cdx`：请求 Wayback CDX API 索引；
 * `enrichment.tombstone.wayback_snapshot`：获取历史原网页 HTML 快照；
@@ -564,9 +599,10 @@ _PREFERRED_SITES = [
 
 ### 7.2 确定性测试矩阵 (`npm test`)
 必须实现以下自动化测试：
-1. **`tombstone-37364867.test.js`**：针对真实的墓碑条目 `37364867`，在 Mock/Cache 环境下验证其标题成功恢复为《情感反诈模拟器》，并成功提取 Steam AppID `3057160`。
-2. **`entity-alignment-33375066.test.js`**：验证 `37364867`（旧）与 `33375066`（新）基于真实捕获的关键词证据与 Steam ID 证据成功对齐，下游投影时间线完整融汇 2025 年与 2026 年两次标记。
-3. **`portable-bundle-verify.test.js`**：对产出的 `doubak-enrichment-<id>` 运行完整性自检，断言 WARC gzip 记录完好、SHA-256 校验通过、且能被现有的 `bundle/v1/validate.py` 校验器成功读取。
+1. **`priority-queue-scheduling.test.js`**：断言包含墓碑与正常条目的全量归档优先消费 P0 队列，并在 P0 完成后触发提前固化提交（Early Commit）。
+2. **`tombstone-37364867.test.js`**：针对真实的墓碑条目 `37364867`，在 Mock/Cache 环境下验证其标题成功恢复为《情感反诈模拟器》，并成功提取 Steam AppID `3057160`。
+3. **`entity-alignment-33375066.test.js`**：验证 `37364867`（旧）与 `33375066`（新）基于真实捕获的关键词证据与 Steam ID 证据成功对齐，下游投影时间线完整融汇 2025 年与 2026 年两次标记。
+4. **`portable-bundle-verify.test.js`**：对产出的 `doubak-enrichment-<id>` 运行完整性自检，断言 WARC gzip 记录完好、SHA-256 校验通过、且能被现有的 `bundle/v1/validate.py` 校验器成功读取。
 
 ---
 
@@ -574,7 +610,7 @@ _PREFERRED_SITES = [
 
 | 阶段 | 交付目标 | 核心工作内容 |
 |---|---|---|
-| **Phase 1** | **便携归档包框架与规范制定 (Bundle Scaffolding & Spec)** | 制定 `doubak-data-specs/enrichment/v1` 规范与 JSON Schema；实现 `doubak-data-enricher` 的 WARC 写入器与归档包骨架。 |
+| **Phase 1** | **便携归档包框架与规范制定 (Bundle Scaffolding & Spec)** | 制定 `doubak-data-specs/enrichment/v1` 规范与 JSON Schema；实现 `doubak-data-enricher` 的 WARC 写入器、优先级队列调度器（P0 丢失优先）与归档包骨架。 |
 | **Phase 2** | **元信息提取器与语言标注 (RawMeta & Lang Detector)** | 实现针对游戏/电影/图书/音乐的 `raw_meta` 启发式规则提取器与零依赖 CJK 语言判定器。 |
 | **Phase 3** | **Wayback 快照与外部 ID 反查 (Automated Tombstone Recovery)** | 实现 Wayback Machine CDX API 客户端与 Wikidata SPARQL 客户端；以 `37364867` 墓碑为基准跑通恢复并封存进 WARC。 |
 | **Phase 4** | **垂直领域知识库对接 (Domain Knowledge Bases)** | 接入 Steam Storefront API 与 TMDB API，拉取官方海报字节写入 WARC。 |
@@ -584,4 +620,4 @@ _PREFERRED_SITES = [
 
 ## 9. 结语
 
-`doubak-data-enricher` 坚决拒绝主观的人工数据篡改，而是依靠历史档案快照、全球公共知识图谱与客观证据链，将每一次外部求证真实地封存在可便携、可冷备的归档包中。它为每一个被平台审查删除或异名重建的作品找回属于它的真实身份，守护数字时代里每一个普通人不可磨灭的文化足迹。
+`doubak-data-enricher` 坚决拒绝主观的人工数据篡改，以条目丢失抢救为最高优先级使命，依靠历史档案快照、全球公共知识图谱与客观证据链，将每一次外部求证真实地封存在可便携、可冷备的归档包中。它为每一个被平台审查删除或异名重建的作品找回属于它的真实身份，守护数字时代里每一个普通人不可磨灭的文化足迹。
