@@ -3,7 +3,7 @@
 > **文档状态：** 架构设计定稿 (Approved Architecture Baseline)  
 > **面向仓库：** `doubak-data-enricher`  
 > **适用版本：** `enrichment/1.0`  
-> **关联规范：** `doubak-data-specs` (canonical/1.1, bundle/1.4), `doubak-site-generator`, `doubak-export-adapters`
+> **关联规范：** `doubak-data-specs` (canonical/1.1, bundle/1.4, enrichment/1.0), `doubak-site-generator`, `doubak-export-adapters`
 
 ---
 
@@ -23,7 +23,8 @@
                                              (可选、带证据溯源、带置信度、本地离线缓存)
                                                          │
                                                          ▼
-                                             [enrichment/ 增强缓存层]
+                                  [doubak-enrichment-<id>/ 便携式增强归档包]
+                                  (可单包备份带走、含完整 WARC 证据与上层 NDJSON)
                                                          │
                                 ┌────────────────────────┴────────────────────────┐
                                 ▼                                                 ▼
@@ -43,12 +44,12 @@
 
 1. **客观事实与派生缓存分离 (Immutable Facts vs. Derived Cache)**  
    WARC 原始捕获与用户标记是不可撼动的客观事实；`canonical` 是客观观测事件日志。Enricher 产出的所有外部 ID、推断元数据及恢复信息**纯属衍生缓存（Derived Cache）**。清空 Enricher 产出，整个系统依靠原始捕获依然能离线全量构建。
-2. **绝不允许主观手填元数据，一切增强必须基于可信证据链 (No Manual Metadata Injection)**  
-   严禁提供主观手工篡改标题、海报、年份等元数据的后门。手填元数据不仅无法保证真实性，还会引入不可维护的第二混乱真相源。Enricher 的所有数据补充，**必须来自有据可查、可重复验证的公开源**（历史抓取快照、Wayback Machine、Wikidata、Steam、TMDB、Bangumi 等）。
-3. **构建与渲染阶段绝不发起网络请求 (Zero Network at Build/Render Time)**  
-   Enricher 是整个流水线中**唯一**被允许发起外部网络请求的组件。一旦抓取完成，所有关联结果及网络原始响应必须**固化落盘在本地**。静态站点生成（`site-generator`）与向第三方导出（`export-adapters`）必须永远保持 100% 离线运行。
-4. **下游非强制依赖 (Strictly Optional Downstream)**  
-   任何下游工具绝不得强制依赖 Enricher。没有 Enricher 产出时，下游依靠纯 `canonical` 必须能无缝退化工作。
+2. **和 Bundle 一样可独立备份、可完整带走 (First-Class Portability)**  
+   Enricher 的产物绝不能是散落于本机 scratchpad 的临时缓存，而必须是一个**独立自包含、有版本清单、可打包压缩带走（Portable）、可离线冷备的一等公民归档包 (`doubak-enrichment-<id>`)**。无论是拷贝至 U 盘还是备份至 NAS，十几年后解压依然立即可用。
+3. **绝不允许主观手填元数据，一切增强必须基于可信证据链 (No Manual Metadata Injection)**  
+   严禁提供主观手工篡改标题、海报、年份等元数据的后门。手填元数据不仅无法保证真实性，还会引入不可维护的第二混乱真相源。Enricher 的所有数据补充，**必须来自有据可查、可重复验证的公开源**（历史抓取快照、Wayback Machine、Wikidata、Steam、TMDB、Bangumi 等），所有原始网络报文完整存入包内的标准 WARC 文件中封存。
+4. **构建与渲染阶段绝不发起网络请求 (Zero Network at Build/Render Time)**  
+   Enricher 是整个流水线中**唯一**被允许发起外部网络请求的组件。一旦抓取完成，所有关联结果及网络原始响应必须**固化落盘在包内**。静态站点生成（`site-generator`）与向第三方导出（`export-adapters`）必须永远保持 100% 离线运行。
 5. **极简审计性与零运行时依赖 (Zero Runtime Dependencies)**  
    遵循 Doubak monorepo 统一工具链：Node ≥ 20，纯原生 ES 模块（ESM），JSDoc 类型标注，`node:test` 单测框架，零第三方 npm 运行时依赖，零构建步骤。
 
@@ -133,7 +134,7 @@
 2. **Tier 2: Wayback Machine CDX API 历史快照提取**  
    * **原理**：针对豆瓣原始 URL（如 `www.douban.com/game/37364867/`）或广播中捕获的短链（如 `douc.cc/2GLwai`），请求 Internet Archive CDX API：  
      `https://web.archive.org/cdx/search/cdx?url=www.douban.com/game/37364867/&output=json&filter=statuscode:200`
-   * **解析**：下载最近一次状态正常的存档快照，重用解析器的原生抽取逻辑提取当时的 `<title>`、`#info` 与海报。  
+   * **解析**：下载最近一次状态正常的存档快照，重用解析器的原生抽取逻辑提取当时的 `<title>`、`#info` 与海报。原始网络响应完整写入归档包的 WARC 文件中。  
    * **置信度**：`source: "wayback:<timestamp>"`, `confidence: 0.95`。
 
 3. **Tier 3: Wikidata 结构化属性精准检索 (SPARQL)**  
@@ -141,11 +142,11 @@
      * 游戏：`wdt:P11867` (Douban Game ID)  
      * 影视：`wdt:P4438` (Douban Movie ID)  
      * 图书：`wdt:P11868` (Douban Book ID)  
-   * **产出**：通过属性关联，获取官方多语言名、Steam AppID (`P1733`)、IMDb ID (`P345`)。  
+   * **产出**：通过属性关联，获取官方多语言名、Steam AppID (`P1733`)、IMDb ID (`P345`)。网络响应写入 WARC 凭证段。  
    * **置信度**：`source: "wikidata:Q..."`, `confidence: 0.90`。
 
 4. **Tier 4: 垂直领域官方数据库比对 (Steam / TMDB / Bangumi)**  
-   * **原理**：当获得确定性的外部 ID（如 Steam AppID `3057160`）时，调用官方 API 拉取经过数字签名的权威官方元数据与封面。  
+   * **原理**：当获得确定性的外部 ID（如 Steam AppID `3057160`）时，调用官方 API 拉取经过数字签名的权威官方元数据与封面。原始 JSON 与海报图片二进制完整存入 WARC 凭证段。  
    * **置信度**：`source: "steam:3057160"`, `confidence: 0.98`。
 
 ---
@@ -202,26 +203,6 @@
 }
 ```
 
-#### 2.2.3 下游合并消费协议
-
-##### A. 静态站点生成器 (`doubak-site-generator`) 如何呈现合并
-* **投影合并聚合 (`projection.js`)**：
-  * 原本的 [`mergeReMarks`](file:///home/mewx/codes/doubak/doubak-site-generator/src/projection.js#L54-L96) 仅在同一 `(medium, subject.id)` 内部合并（处理“同一条目删标重标”）。
-  * 引入 Enricher 后，`mergeReMarks` 接入 `entity_id` 聚类。
-  * **效果**：旧条目 `37364867` 的 2025 年短评、星级、广播时间线，与新条目 `33375066` 的 2026 年最新标记**完整融合成一条完整作品时间线**！
-* **页面生成与重定向 (`markdown.js`)**：
-  * 仅以新 ID 渲染单一作品主页（`game/33375066.md`）。
-  * 旧墓碑 URL `game/37364867.html` 自动生成别名跳转（利用 Hugo `aliases: ["/game/37364867/"]`）。
-  * 页面展示由证据驱动的提示徽章：
-    > ℹ️ *条目合并存证：本作品曾以 ID 37364867 收录，下架后于 33375066 重建。两处记录的时间线与短评已基于 Steam AppID 3057160 与条目别名凭据自动合并。*
-
-##### B. 导出适配器 (`doubak-export-adapters`) 如何处理合并
-* 导出至 NeoDB 时：
-  * 原先旧条目 `37364867` 因上游 URL 为 null 会被当作无法识别丢弃；
-  * 合并后，旧标记的 2025 年历史作为 `ShelfLog` 挂载到主实体下；
-  * `catalog.ndjson` 优先写入有效的 Steam 外部链接或新条目链接 `https://www.douban.com/game/33375066/`；
-  * **成果**：旧标记不再丢失，成功完整导入 NeoDB！
-
 ---
 
 ### 2.3 模块三：元信息结构化提取 (`raw_meta` Parser)
@@ -259,40 +240,39 @@ CLAUDE.md 明确定规：“*The parser must not guess a language tag. Douban's 
    * 包含常见简体规范字：标注为 `zh-Hans`。
    * 拼音转写特征（如带声调字母或空格分隔拼音）：标注为 `zh-Latn-pinyin`。
 
-#### 2.4.2 结构化输出
-为每个别名包装元数据对象：
-```json
-{
-  "title": "Revenge on Gold Diggers",
-  "lang": "en",
-  "type": "official_english",
-  "source": "detected:script_v1",
-  "confidence": 0.98
-}
-```
-
 ---
 
-## 3. 数据规格与本地存储设计 (Data Specification & Storage Design)
+## 3. 便携式增强归档包标准 (Portable Enrichment Bundle Specification)
+
+为了满足用户**“和 Bundle 一样可以备份、带走、长期冷存”**的根本诉求，Enricher 的产物不是单机临时缓存，而是一个自包含、标准化的第一公民归档包。
 
 ### 3.1 目录布局标准
-关联器执行后的本地产出严格与原始数据保持隔离，采用类似 canonical 的人类可读 NDJSON 格式存储：
 
 ```
-~/downloads/enrichment/
-├── README.txt                       ← 双语档案说明文件（面向 2040 年阅读者）
-├── manifest.json                    ← 本次关联运行摘要与统计
-├── subjects.enriched.ndjson         ← 增强后的作品元数据（一一映射或补充 canonical）
-├── entities.ndjson                  ← 实体对齐表（记录 evidence_based same_as 映射）
-└── .cache/                          ← 外部响应原始内容离线缓存（保证 100% 可复现与断网重跑）
-    ├── wayback/                     ← Wayback Machine 原始 HTML/JSON 快照响应
-    ├── wikidata/                    ← Wikidata SPARQL JSON 结果缓存
-    └── steam/                       ← Steam API 原始响应
+doubak-enrichment-<enrichment_id>/
+├── README.txt                               ← 双语纯文本说明（面向 2040 年，说明此归档的来龙去脉与读取方法）
+├── manifest.json                            ← 归档清单（关联账号、依赖的 canonical 版本、证据段 SHA-256、条目统计）
+│
+├── ─── 上层语义层（供下游工具零开销秒读）
+├── subjects.enriched.ndjson                 ← 增强后的作品元数据（标题、别名、语言、外部 ID）
+├── entities.ndjson                          ← 实体对齐表（记录 37364867 ⟷ 33375066 聚合映射）
+│
+└── ─── 底层凭证层（可司法取证、可离线重放的真实网络报文）
+    ├── index-<enrichment_id>.ndjson         ← 外部请求捕获索引（URL、偏移量、长度、SHA-256、Intent）
+    └── data-<enrichment_id>-00001.warc.gz   ← 标准 WARC 1.1（封存所有外部网络交互的原始响应）
 ```
 
-### 3.2 模式定义 (JSON Schemas)
+### 3.2 为什么将网络请求存为 WARC 是可备份归档的最佳选择？
+1. **司法取证级可复现性（Forensic Reproducibility）**：十年之后（如 2036 年），即便 Steam 变更了 API 协议、Wayback Machine 遭受网络阻断，归档包内依然完好封存着 2026 年 Steam 官方服务器返回的原始 HTTP 响应报文与数字头部，以及 Wayback 返回的豆瓣已删除原网页 HTML 字节，具有不可辩驳的证据力。
+2. **双层解耦设计**：
+   * 下游静态站点生成器（`doubak-site-generator`）与导出工具（`doubak-export-adapters`）**直接读取顶层的 `subjects.enriched.ndjson` 与 `entities.ndjson`**，享受纯文本、$O(1)$ 速度与极简性；
+   * 底层的 `data-*.warc.gz` 专注于冷备存证与提供图片原始字节。
+3. **零代码复用现有多媒体提取管道**：
+   `doubak-site-generator/src/images.js` 原生支持扫描 `index-*.ndjson` 并按偏移量从 `data-*.warc.gz` 中解压图片。通过复用这一机制，站点生成器**无需编写任何新代码**，即可把 `doubak-enrichment-*` 当作普通 bundle 统一解压封面图到 `static/covers/`！
 
-#### 3.2.1 `subjects.enriched.ndjson`
+### 3.3 模式定义 (JSON Schemas)
+
+#### 3.3.1 `subjects.enriched.ndjson`
 每行一个合法 JSON 对象：
 
 ```jsonc
@@ -340,10 +320,9 @@ CLAUDE.md 明确定规：“*The parser must not guess a language tag. Douban's 
     "imdb": null
   },
 
-  // 恢复的海报（本地离线相对路径）
+  // 恢复的海报（关联至包内 WARC 证据索引）
   "cover": {
-    "local_path": "covers/game_37364867.jpg",
-    "remote_url": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3057160/header.jpg",
+    "url_key": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3057160/header.jpg",
     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "source": "steam",
     "confidence": 0.98
@@ -372,27 +351,80 @@ CLAUDE.md 明确定规：“*The parser must not guess a language tag. Douban's 
 
 ---
 
-## 4. 下游组件集成规范 (Downstream Contracts)
+## 4. 规范演进规划：`doubak-data-specs` 需要更新的规范清单 (Specifications Evolution)
 
-### 4.1 与 `doubak-site-generator` 的契约
-* 命令行约定：`npm run site -- <canonical> <bundles> [out] [--enrichment <dir>]`
+引入便携式增强归档包后，规范仓库 `doubak-data-specs` 需要相应确立正式的技术规范：
+
+### 4.1 新增第三棵独立的规范树：`enrichment/`
+在 `doubak-data-specs` 根目录下，与 `bundle/` 和 `canonical/` 并列确立第三棵树：
+
+| 规范目录 | 写入方 | 生命周期 | 核心使命 |
+|---|---|---|---|
+| `bundle/` | 抓取工具与导入器 | 用户抓取完成后即**永久冻结** | 忠实记录不可逆的抓取行为与原始字节 |
+| `canonical/` | 解析器 | **随时可迭代演进**（重跑成本极低） | 从 WARC 提取纯粹的客观观测事件日志 |
+| **`enrichment/`** | **数据关联器** | **随时可按需重跑、可独立打包备份** | **建立跨平台实体对齐映射与外部知识关联** |
+
+* **规范文件落地**：
+  * `enrichment/README.md` —— 规范树入口与设计哲学；
+  * `enrichment/v1/SPEC.md` —— 归档包目录布局、校验和算法、字段定义与时间戳语义；
+  * JSON Schema 集合：
+    * `manifest.schema.json`（定义 `spec_version: "enrichment/1.0"`）
+    * `subject-enriched.schema.json`（定义增强字段、来源与置信度模式）
+    * `entity.schema.json`（定义实体的成员集合与 `same_as` 映射）
+  * 词表注册表：
+    * `vocabularies/enrichment-source.json`（枚举来源白名单：`local_archive`, `wayback`, `wikidata`, `steam`, `tmdb`, `heuristic_v1` 等）
+    * `vocabularies/alignment-rule.json`（枚举对齐规则：`external_id_match`, `keyword_match`, `short_url_closure` 等）
+  * 零依赖校验器：`enrichment/v1/validate.py <归档包路径>`（验证结构与哈希完整性）。
+
+### 4.2 `bundle/v1/` 规范的兼容性扩展
+为了保证 `doubak-enrichment-<id>` 内部凭证段使用的 `data-*.warc.gz` 与 `index-*.ndjson` 能被现有的 `bundle/v1/validate.py` 校验器 100% 兼容识别，需要在 `bundle/v1/vocabularies/intent.json` 中追加注册 Enricher 的意图列表：
+
+* `enrichment.tombstone.wayback_cdx`：请求 Wayback CDX API 索引；
+* `enrichment.tombstone.wayback_snapshot`：获取历史原网页 HTML 快照；
+* `enrichment.entity.wikidata_sparql`：查询 Wikidata SPARQL 端点；
+* `enrichment.entity.wikidata_item`：拉取 Wikidata Entity JSON；
+* `enrichment.domain.steam_app`：拉取 Steam 官方 Storefront API；
+* `enrichment.domain.tmdb_item`：拉取 TMDB 影视元数据；
+* `enrichment.asset.cover`：下载恢复出的高清封面图字节。
+
+### 4.3 `canonical/` 规范的交叉引用补充
+* **`canonical/FIELDS.md` §4（`raw_meta` 存储粒度）**：
+  补齐交叉引用，明确指出：“*解析器原样存储的斜杠字符串，由下游 `enrichment/v1` 的规则提取器拆解为结构化字段，存放于 `subjects.enriched.ndjson` 的 `extracted_meta` 命名空间下。*”
+* **`canonical/FIELDS.md` §3（墓碑占位符判定）**：
+  明确指出：“*解析器置为 `title: null` 的墓碑条目，下游 `enrichment/v1` 通过证据链挽救恢复真实标题，并在静态站点与导出适配器中安全消费。*”
+* **`canonical/IDENTITY.md` §2.4（跨观测归并与删掉再重标）**：
+  明确指出：“*上游删除后异 ID 重建产生的两条独立 canonical 条目，在 canonical 保持纯净的前提下，由 `enrichment/v1` 的 `entities.ndjson` 统一聚合为现实作品实体，指导下游站点与导出层的平滑合并。*”
+
+---
+
+## 5. 下游组件集成规范 (Downstream Contracts)
+
+### 5.1 与 `doubak-site-generator` 的契约
+* 命令行约定：
+  ```sh
+  npm run site -- <canonical> <bundles> [out] [--enrichment <enrichment_bundle_dir>]
+  ```
 * 若未传递 `--enrichment`，系统严格保持现有降级行为运行。
 * `projection.js` 在加载 Enricher 产出后：
-  1. `mergeReMarks` 按 `entity_id` 聚合，跨 ID 重建作品的标记与广播自动合并；
-  2. 墓碑作品的 `title` 与 `coverUrl` 由恢复出的有效字段填补，封面引用本地离线图片，**绝对不向外网发起请求**；
-  3. `markdown.js` 生成跳转别名，主页面呈现客观对齐依据。
+  1. `mergeReMarks` 按 `entity_id` 聚合，跨 ID 重建作品（如 `37364867` 与 `33375066`）的标记与广播自动合并；
+  2. 墓碑作品的 `title` 由恢复出的有效字段填补；
+  3. **封面图片零新代码提取**：直接将 `doubak-enrichment-<id>/` 传入 `images.js`，按原有逻辑提取封存的图片到 `static/covers/`，**绝对不向外网发起请求**；
+  4. `markdown.js` 生成跳转别名，主页面呈现客观对齐依据。
 
-### 4.2 与 `doubak-export-adapters` 的契约
-* 命令行约定：`node bin/export.js <canonical> [out] [--enrichment <dir>]`
+### 5.2 与 `doubak-export-adapters` 的契约
+* 命令行约定：
+  ```sh
+  node bin/export.js <canonical> [out] [--enrichment <enrichment_bundle_dir>]
+  ```
 * 导出至 NeoDB 时，若某条目在豆瓣已是墓碑，但已被 Enricher 对齐至存活的新条目或有效的 Steam/IMDb 外部页面，则使用有效链接输出，**避免被抛弃进 `neodb-needs-check.csv`**。
 
 ---
 
-## 5. 参考架构：NeoDB 跨数据源映射与条目合并机制深度剖析 (Reference Architecture: Multi-Source Mapping in NeoDB)
+## 6. 参考架构：NeoDB 跨数据源映射与条目合并机制深度剖析 (Reference Architecture: Multi-Source Mapping in NeoDB)
 
 为了确保设计具备工业级鲁棒性并能与联邦宇宙无缝互通，本节深入 NeoDB 核心源码（基于本地仓库 `/home/mewx/codes/neodb`），系统梳理 NeoDB 在处理多数据源映射与条目合并时的成熟实践，并将其提炼为 Doubak Enricher 的规范指导。
 
-### 5.1 核心数据模型：`Item` 与 `ExternalResource` 的 1:N 枢纽架构
+### 6.1 核心数据模型：`Item` 与 `ExternalResource` 的 1:N 枢纽架构
 NeoDB 的核心模型定义在 `catalog/models/item.py` 与 `catalog/models/common.py` 中：
 
 ```
@@ -419,7 +451,7 @@ NeoDB 的核心模型定义在 `catalog/models/item.py` 与 `catalog/models/comm
   * `url`：该条目的规范 URL；
   * **`other_lookup_ids`（核心资产）**：一个 JSON 字典，保存**该资源自身附带的其他平台全局唯一 ID**（例如在豆瓣电影页面上抓到的 IMDb 号，或图书页提取的 ISBN）。
 
-### 5.2 核心对齐算法：`_match_existing_item` 的五级降级匹配链
+### 6.2 核心对齐算法：`_match_existing_item` 的五级降级匹配链
 在 `item.py:1550` 中，NeoDB 定义了严格的**五级唯一键级联匹配算法**，用于判断一个外部资源是否已经对应库中的某部作品：
 
 ```python
@@ -437,7 +469,7 @@ try match an existing Item in the following order:
 * **零中文标题模糊匹配**：NeoDB 坚决不做中文名称的模糊猜测匹配，所有对齐全部建立在可计算、无歧义的硬性标识符上。
 * **借力交叉标识（`other_lookup_ids`）实现跨平台自动归拢**：如果条目 A（来自 Steam，`id_value: 3057160`）已存在，当一个豆瓣条目 B 携带了 `other_lookup_ids: {'steam': '3057160'}` 进入系统时，第 4 级规则立即触发，NeoDB 自动将豆瓣资源挂载到原有的 Steam `Item` 下，自动完成跨站数据合并！
 
-### 5.3 标识符权威层级与 `IdealIdTypes` 哲学
+### 6.3 标识符权威层级与 `IdealIdTypes` 哲学
 在 `common.py:133` 中，NeoDB 定义了公信力最高的理想主键列表 `IdealIdTypes`：
 
 ```python
@@ -463,7 +495,7 @@ IdealIdTypes = [
 * 商业平台的私有数字 ID 具有易变性、区域性和易被删改的脆弱性；而 ISBN、IMDb、Steam、Wikidata 是全球公认、持久存在的数字公钥。
 * **结论**：Doubak Enricher 的首要任务就是**将脆弱的豆瓣 ID 映射锚定到 `IdealIdTypes` 上**。
 
-### 5.4 豆瓣特有爬虫实现与审查下架（`RESPONSE_CENSORSHIP`）识别
+### 6.4 豆瓣特有爬虫实现与审查下架（`RESPONSE_CENSORSHIP`）识别
 NeoDB 在 `catalog/sites/douban.py:85` 的 `DoubanDownloader.validate_response` 中明文定义了对豆瓣审查页面的识别：
 
 ```python
@@ -481,7 +513,7 @@ elif response.status_code == 200:
 
 NeoDB 明确将这些特征判定为“审查下架”，直接中断抓取。这印证了为什么当条目被豆瓣删除后，NeoDB 会完全丧失对该条目的抓取建档能力。
 
-### 5.5 归档导入时的链接优先级调度（`_PREFERRED_SITES`）
+### 6.5 归档导入时的链接优先级调度（`_PREFERRED_SITES`）
 在用户向 NeoDB 导入备份包时，导入器基类 `journal/importers/base.py:get_item_by_info_and_links` 对条目链接执行优先级排序：
 
 ```python
@@ -505,14 +537,14 @@ _PREFERRED_SITES = [
   如果归档包中仅提供已失效的豆瓣 URL（`https://www.douban.com/game/37364867/`），NeoDB 访问返回 `RESPONSE_CENSORSHIP`，解析失败导致该条目被丢弃；
   **但只要 Doubak Enricher 在 `external_resources` 中附加上 `https://store.steampowered.com/app/3057160/` 或新重建的豆瓣链接**，NeoDB 就会命中 Steam Scraper 或新豆瓣页面，条目成功被创建并与用户的标记绑定！
 
-### 5.6 条目物理合并语义 (`merge_to`)
+### 6.6 条目物理合并语义 (`merge_to`)
 在 `item.py:960` 的 `merge_to` 中，NeoDB 规范了条目合并的标准行为：
 1. `self.merged_to_item = to_item`；
 2. **资源重挂载**：`for res in self.external_resources.all(): res.item = to_item; res.save()`；
 3. **元数据合并与去重**：`uniq(getattr(to_item, k, []) + (v or []))`；
 4. **历史操作平移**：用户指向旧条目的所有 `Mark`、评论与 `ShelfLog` 历史，自动顺着指针归集到合并后的目标条目上。
 
-### 5.7 对 `doubak-data-enricher` 的直接工程启示
+### 6.7 对 `doubak-data-enricher` 的直接工程启示
 
 | NeoDB 成熟机制 | Doubak Enricher 的吸收与规范对齐 |
 |---|---|
@@ -524,32 +556,32 @@ _PREFERRED_SITES = [
 
 ---
 
-## 6. 工程实现与质量保证 (Engineering & Verification)
+## 7. 工程实现与质量保证 (Engineering & Verification)
 
-### 6.1 零外部依赖技术选型
-* **原生 HTTP 与自动缓存**：采用 Node.js 原生 `fetch()`，内置 `RequestCache` 模块。每个网络请求必须将完整响应落盘在 `.cache/`，确保二次执行与断网测试 100% 确定性。
+### 7.1 零外部依赖技术选型
+* **原生 HTTP 与自动打包**：采用 Node.js 原生 `fetch()`，内置流式 WARC 写入器（纯原生 Node.js 流与 `node:zlib`，零第三方 npm 依赖）。
 * **限流与防风控**：对 Internet Archive 与 Wikidata 请求施加原生令牌桶限流，请求间隔 ≥ 1.5 秒，智能退避。
 
-### 6.2 确定性测试矩阵 (`npm test`)
+### 7.2 确定性测试矩阵 (`npm test`)
 必须实现以下自动化测试：
 1. **`tombstone-37364867.test.js`**：针对真实的墓碑条目 `37364867`，在 Mock/Cache 环境下验证其标题成功恢复为《情感反诈模拟器》，并成功提取 Steam AppID `3057160`。
 2. **`entity-alignment-33375066.test.js`**：验证 `37364867`（旧）与 `33375066`（新）基于真实捕获的关键词证据与 Steam ID 证据成功对齐，下游投影时间线完整融汇 2025 年与 2026 年两次标记。
-3. **`zero-network-assertion.test.js`**：在无网络连接状态下，断言 Enricher 能够纯依靠本地缓存 100% 成功生成一致的 NDJSON。
+3. **`portable-bundle-verify.test.js`**：对产出的 `doubak-enrichment-<id>` 运行完整性自检，断言 WARC gzip 记录完好、SHA-256 校验通过、且能被现有的 `bundle/v1/validate.py` 校验器成功读取。
 
 ---
 
-## 7. 实施路线图 (Milestones & Roadmap)
+## 8. 实施路线图 (Milestones & Roadmap)
 
 | 阶段 | 交付目标 | 核心工作内容 |
 |---|---|---|
-| **Phase 1** | **基础框架与实体对齐 (Entity Alignment Core)** | 搭建 `doubak-data-enricher` 基础框架、CLI 入口、基于证据链的 `entities.ndjson` 聚类模型（对齐 NeoDB 1:N 架构）。 |
+| **Phase 1** | **便携归档包框架与规范制定 (Bundle Scaffolding & Spec)** | 制定 `doubak-data-specs/enrichment/v1` 规范与 JSON Schema；实现 `doubak-data-enricher` 的 WARC 写入器与归档包骨架。 |
 | **Phase 2** | **元信息提取器与语言标注 (RawMeta & Lang Detector)** | 实现针对游戏/电影/图书/音乐的 `raw_meta` 启发式规则提取器与零依赖 CJK 语言判定器。 |
-| **Phase 3** | **Wayback 快照与外部 ID 反查 (Automated Tombstone Recovery)** | 实现 Wayback Machine CDX API 客户端与 Wikidata SPARQL 客户端；以 `37364867` 墓碑为基准跑通恢复。 |
-| **Phase 4** | **垂直领域知识库对接 (Domain Knowledge Bases)** | 接入 Steam Storefront API 与 TMDB API，本地固化海报字节。 |
+| **Phase 3** | **Wayback 快照与外部 ID 反查 (Automated Tombstone Recovery)** | 实现 Wayback Machine CDX API 客户端与 Wikidata SPARQL 客户端；以 `37364867` 墓碑为基准跑通恢复并封存进 WARC。 |
+| **Phase 4** | **垂直领域知识库对接 (Domain Knowledge Bases)** | 接入 Steam Storefront API 与 TMDB API，拉取官方海报字节写入 WARC。 |
 | **Phase 5** | **下游流水线贯通 (Downstream Integration & E2E)** | 升级 `doubak-site-generator` 与 `doubak-export-adapters`，实现针对 `37364867` ⟷ `33375066` 的全链路平滑合并渲染，并在 NeoDB 导入中实测验证多链接容灾。 |
 
 ---
 
-## 8. 结语
+## 9. 结语
 
-`doubak-data-enricher` 坚决拒绝主观的人工数据篡改，而是依靠历史档案快照、全球公共知识图谱与客观证据链，为每一个被平台审查删除或异名重建的作品找回属于它的真实身份，守护数字时代里每一个普通人不可磨灭的文化足迹。
+`doubak-data-enricher` 坚决拒绝主观的人工数据篡改，而是依靠历史档案快照、全球公共知识图谱与客观证据链，将每一次外部求证真实地封存在可便携、可冷备的归档包中。它为每一个被平台审查删除或异名重建的作品找回属于它的真实身份，守护数字时代里每一个普通人不可磨灭的文化足迹。
