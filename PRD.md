@@ -16,11 +16,11 @@
 [原始抓取 WARC Bundles]
            │
            ▼
-[doubak-data-parser] ──(纯函数、离线、客观观测)──> [canonical/ 标准归档]
+[doubak-data-parser] ──(纯函数、离线、客观观测)──> [canonical/ 底层客观事实日志]
                                                          │
                                                          ▼
-                                             [doubak-data-enricher] <──(外部公开数据源 / 本地覆盖)
-                                             (可选、带置信度、可离线重跑)
+                                             [doubak-data-enricher] <──(外部公开可信数据源)
+                                             (可选、带证据溯源、带置信度、本地离线缓存)
                                                          │
                                                          ▼
                                              [enrichment/ 增强缓存层]
@@ -28,7 +28,7 @@
                                 ┌────────────────────────┴────────────────────────┐
                                 ▼                                                 ▼
                     [doubak-site-generator]                           [doubak-export-adapters]
-               (投影缓存 → Markdown → 独立网站)                     (无缝迁移至 NeoDB / Letterboxd / Goodreads)
+               (投影合并 → Markdown → 独立网站)                     (无缝迁移至 NeoDB / Letterboxd / Goodreads)
 ```
 
 ### 0.2 为什么必须设计独立的 Enricher
@@ -41,83 +41,64 @@
 ### 0.3 核心设计铁律 (Architectural Invariants)
 本仓库的架构与工程设计必须无条件恪守以下五条铁律：
 
-1. **圣神数据与缓存分离 (Sacred vs. Cache)**  
+1. **客观事实与派生缓存分离 (Immutable Facts vs. Derived Cache)**  
    WARC 原始捕获与用户标记是不可撼动的客观事实；`canonical` 是客观观测事件日志。Enricher 产出的所有外部 ID、推断元数据及恢复信息**纯属衍生缓存（Derived Cache）**。清空 Enricher 产出，整个系统依靠原始捕获依然能离线全量构建。
-2. **构建与渲染阶段绝不发起网络请求 (Zero Network at Build/Render Time)**  
+2. **绝不允许主观手填元数据，一切增强必须基于可信证据链 (No Manual Metadata Injection)**  
+   严禁提供主观手工篡改标题、海报、年份等元数据的后门。手填元数据不仅无法保证真实性，还会引入不可维护的第二混乱真相源。Enricher 的所有数据补充，**必须来自有据可查、可重复验证的公开源**（历史抓取快照、Wayback Machine、Wikidata、Steam、TMDB、Bangumi 等）。
+3. **构建与渲染阶段绝不发起网络请求 (Zero Network at Build/Render Time)**  
    Enricher 是整个流水线中**唯一**被允许发起外部网络请求的组件。一旦抓取完成，所有关联结果及网络原始响应必须**固化落盘在本地**。静态站点生成（`site-generator`）与向第三方导出（`export-adapters`）必须永远保持 100% 离线运行。
-3. **下游非强制依赖 (Strictly Optional Downstream)**  
+4. **下游非强制依赖 (Strictly Optional Downstream)**  
    任何下游工具绝不得强制依赖 Enricher。没有 Enricher 产出时，下游依靠纯 `canonical` 必须能无缝退化工作。
-4. **客观观测与主观推断界限分明 (Facts vs. Inferences)**  
-   解析器记录的是「那一刻豆瓣页面如实说了什么」；Enricher 记录的是「我们通过什么规则推断了什么」。Enricher 输出的每一项增强字段，必须显式携带 `source`（来源标识）、`confidence`（置信度 0.0 ~ 1.0）与 `enriched_at` 时间戳。
 5. **极简审计性与零运行时依赖 (Zero Runtime Dependencies)**  
    遵循 Doubak monorepo 统一工具链：Node ≥ 20，纯原生 ES 模块（ESM），JSDoc 类型标注，`node:test` 单测框架，零第三方 npm 运行时依赖，零构建步骤。
 
 ---
 
-## 1. 核心问题剖析与基准案例 (Problem Statement & Benchmark Cases)
+## 1. 核心问题剖析与真实基准案例 (Problem Statement & Benchmark Cases)
 
-### 1.1 贯穿全篇的基准案例：`game/37364867`《情感反诈模拟器》
+### 1.1 贯穿全篇的真实案例：从《情感反诈模拟器》到《捞女游戏》
 
-为了确保设计的每一步都立足于真实数据，全篇以真实归档中的 **`game/37364867`** 作为基准分析案例：
+为了确保设计的每一步都立足于真实数据，全篇以真实归档中刚刚捕获的完整生命周期作为基准案例：
 
-* **作品背景**：互动叙事电影游戏《情感反诈模拟器》（Steam 英文名：*Revenge on Gold Diggers*，网友戏称《捞女游戏》）。
-* **下架事件**：2026 年 2 月底，该游戏在豆瓣因题材争议被官方无预警全网删除（包括主条目与讨论区）。
-* **Canonical 真实观测状态**：
-  * 在 `subjects.ndjson` 中：
-    ```json
-    {
-      "canonical_version": "canonical/1.1",
-      "medium": "game",
-      "id": "37364867",
-      "url": null,
-      "upstream_deleted": true,
-      "revisions": [{
-        "fields": {
-          "title": null,
-          "aliases": null,
-          "info": null,
-          "cover_url": "https://asset.doubanio.com/cuphead/ilmen-static/pics/subject/game_normal.png",
-          "cover_url_key": "https://asset.doubanio.com/cuphead/ilmen-static/pics/subject/game_normal.png",
-          "raw_meta": null
-        }
-      }]
-    }
-    ```
-  * 在 `marks.ndjson` 中，用户的标记完整保留：
-    * `marked_at`: `2025-07-19`
-    * `status`: `done`（玩过）
-    * `rating`: 4 星（见广播）
-    * `tags`: `["中国", "游戏", "文字冒险", "益智", "互动电影"]`
-    * `comment`: *“游戏做的很用心，还有教学档案，其实也很适合女生玩。这游戏要是10多年前出来就好了，那时候身边好多男PUA特别会撩妹，其实也就是这些技巧。”*
-  * 在 `broadcasts.ndjson` 中，两条广播精准冻结了历史瞬间：
-    * `6413189684`（2025-07-02 11:29:41）：“想玩”
-    * `6532642615`（2025-07-19 19:18:39）：“玩过”，带 4 星评分及上述短评
-  * 短链溯源：捕获的广播 HTML 中包含短链接 `https://douc.cc/2GLwai`，HTTP 302 重定向至 `http://www.douban.com/game/37364867/`。
+* **背景**：互动叙事游戏《情感反诈模拟器》（Steam 英文名：*Revenge on Gold Diggers*，民间亦称《捞女游戏》）。
+* **第一阶段：2025 年的正常标记与后续下架（老条目 `37364867` 沦为墓碑）**：
+  * 用户于 2025-07-02 发广播「想玩」，2025-07-19 标记「玩过」并写下评语：
+    * 评分：4 星（广播冻结）
+    * 标签：`["中国", "游戏", "文字冒险", "益智", "互动电影"]`
+    * 短评：*“游戏做的很用心，还有教学档案，其实也很适合女生玩。这游戏要是10多年前出来就好了，那时候身边好多男PUA (Pick-Up Artist)特别会撩妹，其实也就是这些技巧。”*
+  * 2026 年 2 月底，该游戏在豆瓣因题材争议被官方彻底删除。
+  * **Canonical 真实观测状态**：
+    `subjects.ndjson` 中 `id: "37364867"` 变成墓碑条目：`title: null`, `aliases: null`, `info: null`, `upstream_deleted: true`, 海报退化为通用占位图 `game_normal.png`。
+* **第二阶段：2026 年 10 月以新 ID 重建与用户重标（新条目 `33375066`）**：
+  * 豆瓣以全新条目 ID **`33375066`** 重新收录该游戏，标题更新为《捞女游戏 Revenge on Gold Diggers》。
+  * 用户在最新批次（`doubak-bundle-20261006T221030Z-e8a36c`）中重新将其标记为「玩过」：
+    * 标记日期：`2026-10-06`
+    * 评分：4 星
+    * 标签：`["2025", "中国", "互动电影", "情感"]`
+    * 真实短评：*“我真的无语，我很确定以前还叫《情感反诈模拟器》的时候就标记过，豆瓣删条目又重建条目了看来。当时我还说里面一些恋爱小贴士做的还不错的。不过anyway，这部其实制作还挺精良的”*
+  * 新条目详情页特征：
+    * URL: `https://www.douban.com/game/33375066/`
+    * 标题: `捞女游戏 Revenge on Gold Diggers`
+    * 海报: `https://img9.doubanio.com/lpic/s35470134.jpg`
+    * 关键字 (Keywords): `捞女游戏, Revenge on Gold Diggers, 情感反诈模拟器, 天下无捞, PC, Mac, Linux...`
+
+```
+2025-07-19  用户标记 37364867 (情感反诈模拟器) ───┐
+                                                  │ (2026-02 豆瓣下架删除，37364867 变成墓碑)
+                                                  ▼
+2026-10-06  用户重标 33375066 (捞女游戏) ─────────┴─> 【两份分离的记录！现实中却是同一部作品】
+```
+
 * **痛点现状**：
-  * **在静态站点上**：标题显示为占位符「未知作品」，封面为空，虽然展示了用户的短评与时间线，但浏览者无法得知这部作品究竟叫什么。
-  * **在向 NeoDB 导出时**：`export-adapters` 检查发现 `url` 为 `null`，被无情剔除并计入 `neodb-needs-check.csv`（“连豆瓣链接都没有，没有放进 zip”）。用户用心写的长评和标记无法迁移至新家。
-
-### 1.2 墓碑条目整体分布现状
-在当前用户的全量真实归档（2950 条标记）中，共存在 **8 个上游已删除作品**：
-* 电影 1 部：`11611021`（幸运的是，历史老版本捕获在删除前抓到了详情页，成功保留《在这世界的角落》标题与信息）。
-* 游戏 7 部：`24299254`、`27054820`、`37364867`、`35404095`、`26794548`、`11504723`、`10734267`。
-  * 其中部分早期游戏（如 `24299254`《瘟疫公司》）在老档案中有名字；
-  * 但诸如 `37364867` 以及 `26794548`（标签为 `['恐怖', '台湾', '解谜', '历史']`，实为《返校》），在任何一次捕获中都未留存详情页，在 `canonical` 中标题彻底为 `null`。
-
-### 1.3 豆瓣条目异 ID 重建（Entity Drift & Recreation）
-用户核心洞察：“**don't rely Douban data because they deleted the subject entry and recreate under a different ID!**”
-
-* **机制**：某些作品下架后，过了数月热度消退或换了发行方，豆瓣网友重新申请创建，系统为其分配了全新的数字 ID（例如假设为 `37999888`）。
-* **分裂困境**：
-  * 旧 ID `37364867`：持有用户 2025 年写下的真实短评、时间线、星级，但条目本身是死的；
-  * 新 ID `37999888`：条目元数据活络完整，但与用户的历史没有任何关联。
-* **规则冲突**：根据 `IDENTITY.md` §2.4，两个不同的上游 ID 在 `canonical` 层**绝对不能合并**（那是忠实的客观观测）。因此，**实体对齐（Entity Alignment）的职责必须且只能由 Enricher 承担**！
+  1. **Canonical 层必须保持分离**：根据 `IDENTITY.md` §2.4，`37364867` 与 `33375066` 是两个不同时期、不同 ID 的客观观测，解析器绝不能将其合并成一个，否则就破坏了历史观测的真实性。
+  2. **静态站点上的分裂体验**：若无 Enricher，站点会生成两个孤立页面 —— `game/37364867.html`（叫“未知作品”，带着 2025 年的旧短评）与 `game/33375066.html`（叫“捞女游戏”，带着 2026 年的吐槽），历史脉络彻底断裂。
+  3. **导出适配器上的残缺**：向 NeoDB 导出时，旧标记 `37364867` 因上游 URL 为 null 只能被抛弃在 `neodb-needs-check.csv`，而新标记 `33375066` 缺乏 2025 年那段完整的历史演进。
 
 ---
 
-## 2. 系统功能架构与核心模块 (Functional Specifications)
+## 2. 系统功能规范 (Functional Specifications)
 
-`doubak-data-enricher` 由四大核心子系统组成：
+`doubak-data-enricher` 拒绝任何形式的主观手工编造数据，所有能力均基于**确定性的机器规则、可信凭证与证据链**。系统分为四大核心模块：
 
 ```
                     ┌────────────────────────────────────────────────────────┐
@@ -127,151 +108,119 @@
          ┌───────────────────┬───────────────────┴───────────────────┬───────────────────┐
          ▼                   ▼                                       ▼                   ▼
 ┌─────────────────┐ ┌─────────────────┐                     ┌─────────────────┐ ┌─────────────────┐
-│ 1. 墓碑挽救引擎 │ │ 2. 实体对齐中心 │                     │ 3. 元信息提取器 │ │ 4. 语言标记器   │
+│ 1. 墓碑证据恢复 │ │ 2. 实体证据对齐 │                     │ 3. 元信息提取器 │ │ 4. 语言标记器   │
 │ (Tombstone Rec) │ │ (Entity Align)  │                     │ (RawMeta Parser)│ │ (Lang Tagging)  │
 └─────────────────┘ └─────────────────┘                     └─────────────────┘ └─────────────────┘
-  ├─ Wayback CDX      ├─ Wikidata 桥接 (QID)                  ├─ 正则模式库       ├─ CJK 字符集判定
-  ├─ Wikidata SPARQL  ├─ Steam/IMDb 同构映射                  ├─ 封闭词典比对     ├─ 简繁粤英归类
-  ├─ Steam/Bangumi    ├─ 人工 same_as 映射                    ├─ #info 交叉验证   └─ BCP 47 编码标注
-  └─ 本地快照回溯     └─ 别名归并与重定向生成                 └─ 置信度加权评分
+  ├─ 历史抓取快照比对 ├─ 全球唯一标识 (Steam/IMDb)            ├─ 封闭词典比对     ├─ Unicode 字符集判定
+  ├─ Wayback CDX API  ├─ 页面关键词与又名交叉验证            ├─ 格式模式匹配     ├─ 简繁粤英归类
+  ├─ Wikidata SPARQL  └─ 用户上下文证据对齐                  ├─ #info 表格比对   └─ BCP 47 编码标注
+  └─ 垂直数据库精确匹配                                      └─ 置信度加权打分
 ```
 
 ---
 
-### 2.1 模块一：墓碑挽救引擎 (Tombstone Recovery Engine)
+### 2.1 模块一：墓碑证据恢复引擎 (Tombstone Recovery Engine)
 
-针对 `upstream_deleted === true`（或 `title === null`）的条目，启动分层挽救流水线：
+针对 `upstream_deleted === true`（`title === null`）的墓碑条目，必须通过**客观凭证链**找回真实元数据，拒绝任何“凭空捏造”：
 
-```
-                     [检测到墓碑条目 (title == null)]
-                                    │
-                                    ▼
-                     [Tier 0: 本地人工覆盖 overrides.yaml]
-                        ├── 命中 ──> [直接采纳，置信度 1.0，终止]
-                        └── 未命中
-                                    │
-                                    ▼
-                     [Tier 1: 本地跨版本/历史快照回溯]
-                        ├── 命中 ──> [采纳历史首条非空修订，置信度 1.0]
-                        └── 未命中
-                                    │
-                                    ▼
-                     [Tier 2: Wayback Machine CDX API 检索]
-                        ├── 命中 ──> [抓取快照并解析，置信度 0.95]
-                        └── 未命中
-                                    │
-                                    ▼
-                     [Tier 3: Wikidata 属性反查 (SPARQL)]
-                        ├── 命中 ──> [通过 P11867/P4438 提取，置信度 0.90]
-                        └── 未命中
-                                    │
-                                    ▼
-                     [Tier 4: 垂直领域数据库精准匹配 (Steam/Bangumi/TMDB)]
-                        ├── 命中 ──> [外部知识库确认，置信度 0.85]
-                        └── 未命中 ──> [保持 null，输出警告清单]
-```
+#### 2.1.1 凭证链恢复流水线
 
-#### 2.1.1 检索策略实现细节
+1. **Tier 1: 本地跨版本/历史快照回溯 (Local Archive Traceback)**  
+   * **原理**：检查本地历史所有 bundle 中，是否在该条目被删除前曾抓到过其详情页。  
+   * **实测成果**：真实归档中，`movie/11611021`《在这世界的角落》与 `game/24299254`《瘟疫公司》即在此层 100% 恢复。  
+   * **置信度**：`source: "local_history:bundle_id"`, `confidence: 1.0`。
 
-1. **Wayback Machine CDX API 查询**
-   * **请求构造**：
-     * 主 URL：`https://web.archive.org/cdx/search/cdx?url=www.douban.com/game/37364867/&output=json&filter=statuscode:200`
-     * 针对影视：`movie.douban.com/subject/<id>/`
-     * 广播短链接：针对捕获记录中存在的短链 `douc.cc/2GLwai` 发起检索，跟随历史 302 记录。
-   * **快照提取**：若存在快照，下载最近一次成功的 WARC 或 HTML，利用 `doubak-data-parser` 的原生选择器提取 `<title>`、`#info` 与海报地址。
-   * **标注**：`source: "wayback:20250815T120000Z"`, `confidence: 0.95`。
+2. **Tier 2: Wayback Machine CDX API 历史快照提取**  
+   * **原理**：针对豆瓣原始 URL（如 `www.douban.com/game/37364867/`）或广播中捕获的短链（如 `douc.cc/2GLwai`），请求 Internet Archive CDX API：  
+     `https://web.archive.org/cdx/search/cdx?url=www.douban.com/game/37364867/&output=json&filter=statuscode:200`
+   * **解析**：下载最近一次状态正常的存档快照，重用解析器的原生抽取逻辑提取当时的 `<title>`、`#info` 与海报。  
+   * **置信度**：`source: "wayback:<timestamp>"`, `confidence: 0.95`。
 
-2. **Wikidata SPARQL 查询**
-   * 针对不同媒介，检索对应的豆瓣标识属性：
-     * 游戏：`wdt:P11867` (Douban Game ID)
-     * 电影/剧集：`wdt:P4438` (Douban Movie ID)
-     * 图书：`wdt:P11868` (Douban Book ID)
-   * 查询模板：
-     ```sparql
-     SELECT ?item ?itemLabel ?steamApp ?imdbId ?pubDate WHERE {
-       ?item wdt:P11867 "37364867" .
-       OPTIONAL { ?item wdt:P1733 ?steamApp . }
-       OPTIONAL { ?item wdt:P345 ?imdbId . }
-       OPTIONAL { ?item wdt:P577 ?pubDate . }
-       SERVICE wikibase:label { bd:serviceParam wikibase:language "zh,en,zh-hant". }
-     }
-     ```
-   * 产出：获取标准中文名、外文名、Steam AppID、IMDb ID。
-   * 标注：`source: "wikidata:Q..."`, `confidence: 0.90`。
+3. **Tier 3: Wikidata 结构化属性精准检索 (SPARQL)**  
+   * **原理**：通过 Wikidata 登记的权威属性反向检索：  
+     * 游戏：`wdt:P11867` (Douban Game ID)  
+     * 影视：`wdt:P4438` (Douban Movie ID)  
+     * 图书：`wdt:P11868` (Douban Book ID)  
+   * **产出**：通过属性关联，获取官方多语言名、Steam AppID (`P1733`)、IMDb ID (`P345`)。  
+   * **置信度**：`source: "wikidata:Q..."`, `confidence: 0.90`。
 
-3. **垂直领域数据源适配 (Steam Store API / Bangumi API)**
-   * 当通过 Wikidata 拿到 Steam AppID（如 `3057160`）或通过用户评论中的线索匹配到游戏时，直接调用 Steam 官方 Storefront API：
-     `https://store.steampowered.com/api/appdetails?appids=3057160&l=schinese`
-   * 提取字段：`name` (情感反诈模拟器), `detailed_description`, `header_image` (官方高清海报字节), `publishers`, `genres`。
-   * 标注：`source: "steam:3057160"`, `confidence: 0.98`。
+4. **Tier 4: 垂直领域官方数据库比对 (Steam / TMDB / Bangumi)**  
+   * **原理**：当获得确定性的外部 ID（如 Steam AppID `3057160`）时，调用官方 API 拉取经过数字签名的权威官方元数据与封面。  
+   * **置信度**：`source: "steam:3057160"`, `confidence: 0.98`。
 
 ---
 
-### 2.2 模块二：实体对齐与条目合并 (Subject Entity Alignment & Merging)
+### 2.2 模块二：基于证据的实体对齐与条目合并 (Evidence-based Entity Alignment)
 
-解决“豆瓣删除条目后又以新 ID 重建”导致的历史分裂问题。
+针对豆瓣上游“删除后换 ID 重建”的问题，Enricher 建立独立的实体对齐层，**不修改 canonical 历史，而是在上层产出聚合映射 (`entities.ndjson`)**。
 
-#### 2.2.1 实体抽象模型 (The Entity Concept)
-引入 `Entity`（实体）抽象，作为高于单一平台 ID 的聚合单元：
+#### 2.2.1 自动对齐的四大证据准则 (Zero-Guesswork Alignment Rules)
+为了杜绝误合并，两个豆瓣条目（如 `37364867` 与 `33375066`）被判定为同一现实作品，必须满足以下**至少一条可信证据**：
 
-* **实体定义**：一个现实生活中的作品（例如《情感反诈模拟器》游戏本身），拥有全局唯一的实体标识 `entity_id`（格式：`entity:<medium>:<slug_or_uuid>`）。
-* **成员集合 (`members`)**：
-  * 一个实体可容纳多个上游观测：
-    ```json
+1. **证据 A：外部全球唯一标识一致（Strong External ID Identity）**  
+   * 两个条目经知识库检索后，对应相同的国际公认标识（如拥有完全相同的 Steam AppID `3057160`，或相同的 ISBN、IMDb ID、Wikidata QID）。
+2. **证据 B：上游详情页的别名/关键词强包含（Upstream Metadata Keyword Link）**  
+   * 新条目的页面元数据中明确载有旧条目的名称。  
+   * **实测案例**：在 `game/33375066` 的真实详情页中，`<meta name="keywords">` 显式记录了 `情感反诈模拟器`（正是旧条目 `37364867` 的原名），这构成了上游平台自身提供的强关联证明！
+3. **证据 C：短链接溯源闭环（Short URL Redirection Closure）**  
+   * 旧广播中的短链接跳转或历史网页中的重定向关系形成闭环。
+4. **证据 D：用户第一人称言论的上下文佐证（User Mark Semantic Evidence）**  
+   * 当用户在新条目的标记评语中明确陈述：“*我很确定以前还叫《情感反诈模拟器》的时候就标记过，豆瓣删条目又重建条目了*”，系统通过命名实体与时间轴比对，将此作为辅助判定凭证。
+
+#### 2.2.2 实体对齐产物模型 (`entities.ndjson`)
+当对齐成立时，生成规范实体记录：
+
+```jsonc
+{
+  "entity_id": "entity:game:revenge-on-gold-diggers",
+  "primary_subject_id": "33375066", // 优先使用当前存活活跃的条目 ID
+  "display_title": "捞女游戏 Revenge on Gold Diggers",
+  "members": [
     {
-      "entity_id": "entity:game:revenge-on-gold-diggers",
-      "canonical_title": "情感反诈模拟器",
-      "primary_subject": { "medium": "game", "id": "37599999" },
-      "members": [
-        { "source": "douban", "medium": "game", "id": "37364867", "role": "tombstone" },
-        { "source": "douban", "medium": "game", "id": "37599999", "role": "active" },
-        { "source": "steam", "medium": "game", "id": "3057160", "role": "external" }
-      ],
-      "same_as": [
-        "https://www.douban.com/game/37364867/",
-        "https://www.douban.com/game/37599999/",
-        "https://store.steampowered.com/app/3057160/"
-      ]
+      "medium": "game",
+      "subject_id": "37364867",
+      "status": "tombstone",
+      "evidence": "keywords_match:情感反诈模拟器"
+    },
+    {
+      "medium": "game",
+      "subject_id": "33375066",
+      "status": "active",
+      "evidence": "upstream_current"
     }
-    ```
-
-#### 2.2.2 对齐启发式与人工干预 (Alignment Engine)
-1. **自动对齐判据**：
-   * **外部强唯一键重合**：两个豆瓣条目若通过 Wikidata / 详情页反查拥有相同的 Steam AppID、ISBN 或 IMDb ID，则自动判定为同一实体。
-   * **标题 + 核心发行时间 + 核心创作者高度重合**。
-2. **人工声明优先 (`overrides.yaml`)**：
-   在任何不确定的场景下，用户拥有最终决定权。Enricher 读取本地 `overrides.yaml`：
-   ```yaml
-   entities:
-     - entity_id: "entity:game:37364867"
-       title: "情感反诈模拟器"
-       primary_id: "37599999"    # 若豆瓣已重建新条目，指定为主显示 ID
-       merge_subjects:
-         - "game:37364867"       # 旧墓碑条目
-         - "game:37599999"       # 新重建条目
-       external_ids:
-         steam: "3057160"
-         wikidata: "Q131920199"
-   ```
+  ],
+  "same_as": [
+    "https://www.douban.com/game/37364867/",
+    "https://www.douban.com/game/33375066/",
+    "https://store.steampowered.com/app/3057160/"
+  ],
+  "external_ids": {
+    "steam": "3057160"
+  },
+  "alignment_rule": "external_id_and_keyword_match",
+  "confidence": 0.99
+}
+```
 
 #### 2.2.3 下游合并消费协议
 
 ##### A. 静态站点生成器 (`doubak-site-generator`) 如何呈现合并
-* **投影合并升级 (`projection.js`)**：
-  * 原有逻辑仅对单一 `(medium, subject.id)` 执行 `mergeReMarks`；
-  * 引入 Enricher 后，`mergeReMarks` 改为依据 **`entity_id`** 聚类。
-  * 聚合所有成员（无论来自旧 ID `37364867` 还是新 ID `37599999`）的历史标记与广播，生成单一完整的「说过什么」时间线！
+* **投影合并聚合 (`projection.js`)**：
+  * 原本的 [`mergeReMarks`](file:///home/mewx/codes/doubak/doubak-site-generator/src/projection.js#L54-L96) 仅在同一 `(medium, subject.id)` 内部合并（处理“同一条目删标重标”）。
+  * 引入 Enricher 后，`mergeReMarks` 接入 `entity_id` 聚类。
+  * **效果**：旧条目 `37364867` 的 2025 年短评、星级、广播时间线，与新条目 `33375066` 的 2026 年最新标记**完整融合成一条完整作品时间线**！
 * **页面生成与重定向 (`markdown.js`)**：
-  * 主页面以 `primary_id`（如 `game/37599999.md`）渲染。
-  * 若用户访问旧墓碑地址 `game/37364867.html`，Hugo 骨架自动生成 `<meta http-equiv="refresh">` 别名跳转（利用 front matter `aliases: ["/game/37364867/"]`）。
-  * 页面展示提示框：
-    > **条目重整说明**：此作品在豆瓣原 ID 为 `37364867`（已下架），后于 `37599999` 重建。本站已自动聚合两处记录的历史时间线与短评。
+  * 仅以新 ID 渲染单一作品主页（`game/33375066.md`）。
+  * 旧墓碑 URL `game/37364867.html` 自动生成别名跳转（利用 Hugo `aliases: ["/game/37364867/"]`）。
+  * 页面展示由证据驱动的提示徽章：
+    > ℹ️ *条目合并存证：本作品曾以 ID 37364867 收录，下架后于 33375066 重建。两处记录的时间线与短评已基于 Steam AppID 3057160 与条目别名凭据自动合并。*
 
 ##### B. 导出适配器 (`doubak-export-adapters`) 如何处理合并
 * 导出至 NeoDB 时：
-  * 抛弃已失效无法访问的墓碑链接 `https://www.douban.com/game/37364867/`；
-  * 优先使用外部标准链接 `https://store.steampowered.com/app/3057160/`，或重建后的活跃链接 `https://www.douban.com/game/37599999/` 注入 `catalog.ndjson` 中的 `links` 列；
-  * **成果**：彻底修复当前导出中 `⚠ 5 条连豆瓣链接都没有，没有放进 zip` 的缺陷，实现 100% 成功入库。
+  * 原先旧条目 `37364867` 因上游 URL 为 null 会被当作无法识别丢弃；
+  * 合并后，旧标记的 2025 年历史作为 `ShelfLog` 挂载到主实体下；
+  * `catalog.ndjson` 优先写入有效的 Steam 外部链接或新条目链接 `https://www.douban.com/game/33375066/`；
+  * **成果**：旧标记不再丢失，成功完整导入 NeoDB！
 
 ---
 
@@ -281,11 +230,11 @@
 
 #### 2.3.1 跨媒介提取模式库
 
-| 媒介 | 原始字符串示例 | 提取目标字段 | 提取判据与启发式 |
+| 媒介 | 真实字符串示例 | 提取目标字段 | 提取判据与启发式 |
 |---|---|---|---|
+| **游戏 (`desc`)** | `PC / MAC / LIN / IPHN / ANDR / PS5 / XSX / NS / NS 2 / PS4 / XONE / 文字冒险 / 益智 / 模拟 / 2025-06-19` | `platforms`, `genres`, `release_dates` | 平台词典闭集匹配（PC、MAC、PS5、NS 2 等）；游戏类型库匹配；ISO 日期提取。 |
 | **图书 (`pub`)** | `[美] 罗伯特·T·清崎 / 萧明 / 四川人民出版社 / 2019-8-1 / 89.00元` | `authors`, `translators`, `publisher`, `pub_date`, `price` | 正则识别末尾价格 (`\d+元|\$|￥`)；日期提取 (`\d{4}-\d{1,2}`)；国籍前缀识别 (`\[.+?\]`)；出版社名单库比对。 |
 | **音乐 (`intro`)**| `星野源 / 2016-10-05 / Limited Edition / CD / 流行` | `artists`, `release_date`, `edition`, `media_format`, `genres` | 介质字典 (`CD\|Vinyl\|LP\|数字`)；日期提取；流派词典 (`流行\|摇滚\|民谣\|爵士`)。 |
-| **游戏 (`desc`)** | `PC / PS5 / NS / PS4 / 角色扮演 / 2023-03-24 / 2023-03-24` | `platforms`, `genres`, `release_dates` | 平台闭集匹配 (`PC\|PS5\|PS4\|NS\|Xbox\|Switch\|Mac\|iOS\|Android`)；游戏类型库匹配。 |
 | **影视 (`intro`)**| `2026-01-23(美国/中国大陆) / 杰瑞米·艾文 / ... / 103分钟 / 悬疑 / 英语` | `release_date`, `regions`, `cast`, `runtime_minutes`, `genres`, `languages` | 正则识别时长 (`\d+分钟`)；全球国家/地区词典；ISO 语言词典；首位上映日提取。 |
 
 #### 2.3.2 交叉验证与自校验
@@ -314,12 +263,11 @@ CLAUDE.md 明确定规：“*The parser must not guess a language tag. Douban's 
 为每个别名包装元数据对象：
 ```json
 {
-  "title": "捞女游戏",
-  "lang": "zh-Hans",
-  "region": "CN",
-  "type": "colloquial_alias",
+  "title": "Revenge on Gold Diggers",
+  "lang": "en",
+  "type": "official_english",
   "source": "detected:script_v1",
-  "confidence": 0.95
+  "confidence": 0.98
 }
 ```
 
@@ -335,9 +283,8 @@ CLAUDE.md 明确定规：“*The parser must not guess a language tag. Douban's 
 ├── README.txt                       ← 双语档案说明文件（面向 2040 年阅读者）
 ├── manifest.json                    ← 本次关联运行摘要与统计
 ├── subjects.enriched.ndjson         ← 增强后的作品元数据（一一映射或补充 canonical）
-├── entities.ndjson                  ← 实体对齐表（记录 same_as 与多 ID 聚合关系）
-├── overrides.yaml                   ← 用户本地手工标注侧车文件（可提交至私有仓库）
-└── .cache/                          ← 外部响应原始内容离线缓存
+├── entities.ndjson                  ← 实体对齐表（记录 evidence_based same_as 映射）
+└── .cache/                          ← 外部响应原始内容离线缓存（保证 100% 可复现与断网重跑）
     ├── wayback/                     ← Wayback Machine 原始 HTML/JSON 快照响应
     ├── wikidata/                    ← Wikidata SPARQL JSON 结果缓存
     └── steam/                       ← Steam API 原始响应
@@ -346,14 +293,14 @@ CLAUDE.md 明确定规：“*The parser must not guess a language tag. Douban's 
 ### 3.2 模式定义 (JSON Schemas)
 
 #### 3.2.1 `subjects.enriched.ndjson`
-每行一个合法 JSON 对象，键名与 canonical 保持一致性与可预测性：
+每行一个合法 JSON 对象：
 
 ```jsonc
 {
   "enrichment_version": "enrichment/1.0",
   "medium": "game",
   "id": "37364867",
-  "entity_id": "entity:game:37364867",
+  "entity_id": "entity:game:revenge-on-gold-diggers",
   
   // 墓碑条目恢复声明
   "tombstone": {
@@ -362,10 +309,10 @@ CLAUDE.md 明确定规：“*The parser must not guess a language tag. Douban's 
     "recovery_tier": "wayback_and_steam"
   },
 
-  // 恢复或修正后的标题
+  // 恢复的标题（带证据来源）
   "title": {
     "value": "情感反诈模拟器",
-    "source": "wayback:2025-08",
+    "source": "wayback:20250815T120000Z",
     "confidence": 0.95,
     "enriched_at": "2026-10-07T09:30:00Z"
   },
@@ -390,11 +337,10 @@ CLAUDE.md 明确定规：“*The parser must not guess a language tag. Douban's 
   "external_ids": {
     "wikidata": "Q131920199",
     "steam": "3057160",
-    "imdb": null,
-    "bgm": null
+    "imdb": null
   },
 
-  // 恢复的海报图片（存储本地相对路径）
+  // 恢复的海报（本地离线相对路径）
   "cover": {
     "local_path": "covers/game_37364867.jpg",
     "remote_url": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/3057160/header.jpg",
@@ -411,12 +357,12 @@ CLAUDE.md 明确定规：“*The parser must not guess a language tag. Douban's 
       "confidence": 0.95
     },
     "genres": {
-      "value": ["角色扮演", "文字冒险", "互动电影"],
+      "value": ["文字冒险", "益智", "模拟"],
       "source": "extracted:heuristic_v1",
       "confidence": 0.90
     },
     "release_date": {
-      "value": "2024-08-01",
+      "value": "2025-06-19",
       "source": "steam:3057160",
       "confidence": 0.98
     }
@@ -424,137 +370,35 @@ CLAUDE.md 明确定规：“*The parser must not guess a language tag. Douban's 
 }
 ```
 
-#### 3.2.2 `entities.ndjson`
-每行记录一个跨平台/跨 ID 的聚合实体：
-
-```jsonc
-{
-  "enrichment_version": "enrichment/1.0",
-  "entity_id": "entity:game:37364867",
-  "primary_subject_id": "37364867", // 或重建后的新 ID
-  "display_title": "情感反诈模拟器",
-  "members": [
-    {
-      "medium": "game",
-      "subject_id": "37364867",
-      "status": "tombstone",
-      "reason": "upstream_deleted"
-    },
-    {
-      "medium": "game",
-      "subject_id": "37599999",
-      "status": "active",
-      "reason": "upstream_recreated"
-    }
-  ],
-  "same_as": [
-    "douban:game:37364867",
-    "douban:game:37599999",
-    "steam:3057160",
-    "wikidata:Q131920199"
-  ],
-  "aligned_by": "manual", // manual | wikidata_exact | meta_heuristic
-  "updated_at": "2026-10-07T09:30:00Z"
-}
-```
-
 ---
 
 ## 4. 下游组件集成规范 (Downstream Contracts)
 
-### 4.1 与 `doubak-site-generator` 的契约与行为规范
+### 4.1 与 `doubak-site-generator` 的契约
+* 命令行约定：`npm run site -- <canonical> <bundles> [out] [--enrichment <dir>]`
+* 若未传递 `--enrichment`，系统严格保持现有降级行为运行。
+* `projection.js` 在加载 Enricher 产出后：
+  1. `mergeReMarks` 按 `entity_id` 聚合，跨 ID 重建作品的标记与广播自动合并；
+  2. 墓碑作品的 `title` 与 `coverUrl` 由恢复出的有效字段填补，封面引用本地离线图片，**绝对不向外网发起请求**；
+  3. `markdown.js` 生成跳转别名，主页面呈现客观对齐依据。
 
-#### 命令行调用约定
-```sh
-npm run site -- <canonical 目录> <bundle 目录> [产出目录] [--enrichment <enrichment 目录>]
-```
-若未传递 `--enrichment`，系统保持现有降级行为运行。
-
-#### `projection.js` 适配修改
-1. **加载 Enricher 数据**：
-   在 `project()` 函数入口处，若传入 `enrichment` 选项，读取 `subjects.enriched.ndjson` 与 `entities.ndjson`，构建查找索引：
-   * `entityBySubject`: `Map<"medium:id", Entity>`
-   * `enrichedSubject`: `Map<"medium:id", EnrichedSubject>`
-2. **`mergeReMarks` 聚类升级**：
-   ```javascript
-   // 原逻辑：const key = `${m.medium}:${m.subject.id}`;
-   // 升级为：
-   const entity = entityBySubject.get(`${m.medium}:${m.subject.id}`);
-   const key = entity ? entity.entity_id : `${m.medium}:${m.subject.id}`;
-   ```
-   **效果**：旧墓碑 ID 与新重建 ID 的标记与广播将自动聚合进同一个作品组中！
-3. **墓碑标题与海报填补**：
-   在 `projectMark()` 中：
-   ```javascript
-   const enriched = enrichedSubject.get(`${m.medium}:${m.subject.id}`);
-   const title = s?.fields?.title ?? enriched?.title?.value ?? null;
-   const coverUrl = realCover(s?.fields?.cover_url) ?? enriched?.cover?.local_path ?? null;
-   ```
-   **离线保障**：若 Enricher 在抓取时已将恢复的海报图片持久化下载至 `covers/` 目录，则此处 `coverUrl` 为合法的本地相对路径，**绝对不向 doubanio 或第三方服务发送网络请求**，完美维护站点离线浏览原则。
-
-#### `markdown.js` 页面渲染增强
-* Front matter 注入拓展属性：
-  ```yaml
-  douban_upstream_deleted: true
-  douban_recovered_title: true
-  douban_recovery_source: "Wayback Machine / Steam"
-  douban_entity_id: "entity:game:37364867"
-  douban_external_links:
-    steam: "https://store.steampowered.com/app/3057160/"
-    wikidata: "https://www.wikidata.org/wiki/Q131920199"
-  ```
-* 页面模板展示：
-  若检测到 `douban_recovered_title`，在标题下方呈现友好的温和徽章：
-  > 📌 *本条目在豆瓣已下架，作品名称与封面系由豆备通过历史快照与公开数据库对齐恢复。*
-
----
-
-### 4.2 与 `doubak-export-adapters` 的契约与行为规范
-
-#### 命令行调用约定
-```sh
-node bin/export.js <canonical 目录> [输出目录] [--enrichment <enrichment 目录>]
-```
-
-#### 导出逻辑升级
-1. **拯救被排除的墓碑条目**：
-   * 在处理 NeoDB 导出时，目前凡是 `url === null`（即上游已删除）的条目均会被直接丢弃至 `neodb-needs-check.csv`。
-   * 读取 Enricher 数据后：若作品拥有 `external_ids.steam` 或关联的重建豆瓣条目，生成规范链接：
-     * `https://store.steampowered.com/app/3057160/`
-     * 或关联的新豆瓣 URL
-   * 该条目立即重新具备合格的匹配基准，成功进入 `catalog.ndjson`，**不再丢失任何一条标记！**
-2. **外部精准标识赋能**：
-   * **Letterboxd**：直接读取 `enriched.external_ids.imdb`，解决 34 部缺失 IMDb 编号的电影无法导出的问题。
-   * **Goodreads**：优先读取提取的 ISBN 标识，极大提升图书匹配率。
+### 4.2 与 `doubak-export-adapters` 的契约
+* 命令行约定：`node bin/export.js <canonical> [out] [--enrichment <dir>]`
+* 导出至 NeoDB 时，若某条目在豆瓣已是墓碑，但已被 Enricher 对齐至存活的新条目或有效的 Steam/IMDb 外部页面，则使用有效链接输出，**避免被抛弃进 `neodb-needs-check.csv`**。
 
 ---
 
 ## 5. 工程实现与质量保证 (Engineering & Verification)
 
 ### 5.1 零外部依赖技术选型
-* **HTTP 请求与缓存**：使用 Node.js 原生 `fetch()`，配合统一的 `RequestCache` 模块。所有发出的网络请求必须按 URL SHA-256 哈希完整缓存响应正文与头部至 `.cache/` 目录。二次执行时优先读本地缓存，断网状态下自动切换为 `--offline` 模式。
-* **速率与风控控制**：针对 Wayback Machine 与 Wikidata SPARQL 端点，实现内置令牌桶限流器（Tokens Bucket），请求间隔严格控制在 1.5 秒以上，自动响应 HTTP 429 退避重试。
-* **YAML 解析**：为 `overrides.yaml` 提供零依赖的极简子集 YAML 解析器（类似 `doubak-site-generator/src/yaml.js`），支持键值对、嵌套字典与数组列表，无需引入 `yaml` npm 包。
+* **原生 HTTP 与自动缓存**：采用 Node.js 原生 `fetch()`，内置 `RequestCache` 模块。每个网络请求必须将完整响应落盘在 `.cache/`，确保二次执行与断网测试 100% 确定性。
+* **限流与防风控**：对 Internet Archive 与 Wikidata 请求施加原生令牌桶限流，请求间隔 ≥ 1.5 秒，智能退避。
 
-### 5.2 确定性与断网契约测试 (Determinism & Offline Verification)
-
-必须编写以下回归测试用例，纳入 `npm test`（`node:test`）：
-
-1. **`benchmark-37364867.test.js`**：
-   * 输入包含墓碑条目 `game/37364867` 的 canonical 切片；
-   * 模拟离线环境（网络端点全 Mock 或读取已提交的 Fixture 缓存）；
-   * 断言：
-     * Enricher 输出的 `subjects.enriched.ndjson` 中标题成功恢复为《情感反诈模拟器》；
-     * 别名包含《捞女游戏》与《Revenge on Gold Diggers》；
-     * 语言标签正确判定为 `zh-Hans` 与 `en`；
-     * Steam AppID 成功对齐为 `3057160`。
-2. **`entity-alignment-merge.test.js`**：
-   * 构造包含条目 `A`（墓碑，2023 年标记）与条目 `B`（重建，2025 年标记）的双重数据源；
-   * 在 `overrides.yaml` 中声明 `A same_as B`；
-   * 运行投影计算，断言合并后的作品仅产出 1 个聚合页面，时间线包含 2023 与 2025 两个事件，历史版本计数正确递增。
-3. **`zero-network-guarantee.test.js`**：
-   * 拦截全局 `globalThis.fetch` 与 `node:https`；
-   * 运行带有 `--offline` 标志的 Enricher，断言在完整读取本地缓存的情况下能够 100% 成功生成一致的 NDJSON 文件，未触发任何网络调用。
+### 5.2 确定性测试矩阵 (`npm test`)
+必须实现以下自动化测试：
+1. **`tombstone-37364867.test.js`**：针对真实的墓碑条目 `37364867`，在 Mock/Cache 环境下验证其标题成功恢复为《情感反诈模拟器》，并成功提取 Steam AppID `3057160`。
+2. **`entity-alignment-33375066.test.js`**：验证 `37364867`（旧）与 `33375066`（新）基于真实捕获的关键词证据与 Steam ID 证据成功对齐，下游投影时间线完整融汇 2025 年与 2026 年两次标记。
+3. **`zero-network-assertion.test.js`**：在无网络连接状态下，断言 Enricher 能够纯依靠本地缓存 100% 成功生成一致的 NDJSON。
 
 ---
 
@@ -562,14 +406,14 @@ node bin/export.js <canonical 目录> [输出目录] [--enrichment <enrichment �
 
 | 阶段 | 交付目标 | 核心工作内容 |
 |---|---|---|
-| **Phase 1** | **本地侧车与实体声明 (Manual Sidecar & Scaffolding)** | 搭建 `doubak-data-enricher` 基础框架、CLI 入口、`overrides.yaml` 解析器与零网络本地合并机制。立即解决已有数据的紧急手动对齐。 |
-| **Phase 2** | **元信息提取器与语言标注 (RawMeta & Lang Detector)** | 实现针对电影/图书/音乐/游戏的 `raw_meta` 启发式规则提取器与 CJK/Latin 零依赖语言判定器，跑通单元测试。 |
-| **Phase 3** | **Wayback 快照与外部 ID 反查 (Automated Tombstone Recovery)** | 实现 Wayback Machine CDX API 客户端与 Wikidata SPARQL 客户端；以 `game/37364867` 为标杆跑通全自动墓碑恢复与缓存机制。 |
-| **Phase 4** | **垂直领域知识库对接 (Domain Databases)** | 接入 Steam Storefront API 与 TMDB API 检索器，支持高清海报与官方元数据本地固化缓存。 |
-| **Phase 5** | **下游流水线贯通 (Downstream Integration & E2E)** | 升级 `doubak-site-generator` 与 `doubak-export-adapters`，支持 `--enrichment` 参数，完成全量真实归档的站点构建与 NeoDB 导出回测。 |
+| **Phase 1** | **基础框架与实体对齐 (Entity Alignment Core)** | 搭建 `doubak-data-enricher` 基础框架、CLI 入口、基于证据链的 `entities.ndjson` 聚类模型。 |
+| **Phase 2** | **元信息提取器与语言标注 (RawMeta & Lang Detector)** | 实现针对游戏/电影/图书/音乐的 `raw_meta` 启发式规则提取器与零依赖 CJK 语言判定器。 |
+| **Phase 3** | **Wayback 快照与外部 ID 反查 (Automated Tombstone Recovery)** | 实现 Wayback Machine CDX API 客户端与 Wikidata SPARQL 客户端；以 `37364867` 墓碑为基准跑通恢复。 |
+| **Phase 4** | **垂直领域知识库对接 (Domain Knowledge Bases)** | 接入 Steam Storefront API 与 TMDB API，本地固化海报字节。 |
+| **Phase 5** | **下游流水线贯通 (Downstream Integration & E2E)** | 升级 `doubak-site-generator` 与 `doubak-export-adapters`，实现针对 `37364867` ⟷ `33375066` 的全链路平滑合并渲染。 |
 
 ---
 
 ## 7. 结语
 
-`doubak-data-enricher` 不仅是一个技术修补工具，更是豆备抵抗数字遗忘（Digital Decay）与平台审查的关键屏障。通过将**客观历史观测**与**外部知识库推断**严谨分离，我们既捍卫了档案的法律取证级真实性，又为每一个个体留住了那些本已被平台宣判“不存在”的文化记忆与人生轨迹。
+`doubak-data-enricher` 坚决拒绝主观的人工数据篡改，而是依靠历史档案快照、全球公共知识图谱与客观证据链，为每一个被平台审查删除或异名重建的作品找回属于它的真实身份，守护数字时代里每一个普通人不可磨灭的文化足迹。
