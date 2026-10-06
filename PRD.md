@@ -86,7 +86,7 @@
 2025-07-19  用户标记 37364867 (情感反诈模拟器) ───┐
                                                   │ (2026-02 豆瓣下架删除，37364867 变成墓碑)
                                                   ▼
-2026-10-06  用户重标 33375066 (捞女游戏) ─────────┴─> 【两份分离的记录！现实中却是同一部作品】
+2026-10-06  用户重标 33375066 (捞女游戏) ─────────┴─> 【两份分离的客观观测！现实中是同一部作品】
 ```
 
 * **痛点现状**：
@@ -388,13 +388,149 @@ CLAUDE.md 明确定规：“*The parser must not guess a language tag. Douban's 
 
 ---
 
-## 5. 工程实现与质量保证 (Engineering & Verification)
+## 5. 参考架构：NeoDB 跨数据源映射与条目合并机制深度剖析 (Reference Architecture: Multi-Source Mapping in NeoDB)
 
-### 5.1 零外部依赖技术选型
+为了确保设计具备工业级鲁棒性并能与联邦宇宙无缝互通，本节深入 NeoDB 核心源码（基于本地仓库 `/home/mewx/codes/neodb`），系统梳理 NeoDB 在处理多数据源映射与条目合并时的成熟实践，并将其提炼为 Doubak Enricher 的规范指导。
+
+### 5.1 核心数据模型：`Item` 与 `ExternalResource` 的 1:N 枢纽架构
+NeoDB 的核心模型定义在 `catalog/models/item.py` 与 `catalog/models/common.py` 中：
+
+```
+                ┌───────────────────────────────────────┐
+                │          NeoDB Item (现实作品)        │
+                │  (Game / Movie / TVSeason / Edition)  │
+                └───────────────────────────────────────┘
+                                    ▲
+                                    │ (1 : N 外键关联)
+         ┌──────────────────────────┼──────────────────────────┐
+         │                          │                          │
+┌─────────────────┐        ┌─────────────────┐        ┌─────────────────┐
+│ExternalResource │        │ExternalResource │        │ExternalResource │
+│豆瓣旧条目 37364867│        │豆瓣新条目 33375066│        │Steam App 3057160│
+│(IdType:         │        │(IdType:         │        │(IdType: Steam,  │
+│ DoubanGame)     │        │ DoubanGame)     │        │ other_lookup_ids│
+└─────────────────┘        └─────────────────┘        └─────────────────┘
+```
+
+* **`Item`（多态实体）**：代表现实中的作品实体（Game, Movie, Edition 等），是所有用户标记、评分与书架动态的主锚点。
+* **`ExternalResource`（外部数据源快照）**：代表特定网站上的条目页面。关键字段包含：
+  * `id_type`：站点分类枚举（如 `doubangame`, `doubanmovie`, `steam`, `imdb` 等）；
+  * `id_value`：该站点的唯一主键（如 `33375066`, `3057160`, `tt...`）；
+  * `url`：该条目的规范 URL；
+  * **`other_lookup_ids`（核心资产）**：一个 JSON 字典，保存**该资源自身附带的其他平台全局唯一 ID**（例如在豆瓣电影页面上抓到的 IMDb 号，或图书页提取的 ISBN）。
+
+### 5.2 核心对齐算法：`_match_existing_item` 的五级降级匹配链
+在 `item.py:1550` 中，NeoDB 定义了严格的**五级唯一键级联匹配算法**，用于判断一个外部资源是否已经对应库中的某部作品：
+
+```python
+"""
+try match an existing Item in the following order:
+1. id_type/id_value 匹配 Item 的主主键 (primary_lookup_id)
+2. any other_lookup_ids 匹配 Item 的主主键
+3. id_type/id_value 匹配库中已有外部资源的 other_lookup_ids
+4. any other_lookup_ids 匹配库中已有外部资源的 id_type/id_value
+5. any other_lookup_ids 与库中已有外部资源的 other_lookup_ids 相交匹配
+"""
+```
+
+**工程启示**：
+* **零中文标题模糊匹配**：NeoDB 坚决不做中文名称的模糊猜测匹配，所有对齐全部建立在可计算、无歧义的硬性标识符上。
+* **借力交叉标识（`other_lookup_ids`）实现跨平台自动归拢**：如果条目 A（来自 Steam，`id_value: 3057160`）已存在，当一个豆瓣条目 B 携带了 `other_lookup_ids: {'steam': '3057160'}` 进入系统时，第 4 级规则立即触发，NeoDB 自动将豆瓣资源挂载到原有的 Steam `Item` 下，自动完成跨站数据合并！
+
+### 5.3 标识符权威层级与 `IdealIdTypes` 哲学
+在 `common.py:133` 中，NeoDB 定义了公信力最高的理想主键列表 `IdealIdTypes`：
+
+```python
+IdealIdTypes = [
+    IdType.ISBN,
+    IdType.CUBN,
+    IdType.ASIN,
+    IdType.GTIN,
+    IdType.ISRC,
+    IdType.OCLC,
+    IdType.MusicBrainz_ReleaseGroup,
+    IdType.RSS,
+    IdType.IMDB,
+    IdType.Steam,
+    IdType.Itch,
+    IdType.WikiData,
+    IdType.TMDB_Person,
+]
+```
+
+**关键设计洞察**：
+* 豆瓣的所有私有 ID（`DoubanMovie`, `DoubanBook`, `DoubanGame`）**均不在 `IdealIdTypes` 中**！
+* 商业平台的私有数字 ID 具有易变性、区域性和易被删改的脆弱性；而 ISBN、IMDb、Steam、Wikidata 是全球公认、持久存在的数字公钥。
+* **结论**：Doubak Enricher 的首要任务就是**将脆弱的豆瓣 ID 映射锚定到 `IdealIdTypes` 上**。
+
+### 5.4 豆瓣特有爬虫实现与审查下架（`RESPONSE_CENSORSHIP`）识别
+NeoDB 在 `catalog/sites/douban.py:85` 的 `DoubanDownloader.validate_response` 中明文定义了对豆瓣审查页面的识别：
+
+```python
+elif response.status_code == 204:
+    return RESPONSE_CENSORSHIP
+elif response.status_code == 200:
+    content = response.content.decode("utf-8")
+    if (
+        content.find("<title>页面不存在</title>") != -1
+        or content.find("呃... 你想访问的条目豆瓣不收录。") != -1
+        or content.find("根据相关法律法规，当前条目正在等待审核。") != -1
+    ):
+        return RESPONSE_CENSORSHIP
+```
+
+NeoDB 明确将这些特征判定为“审查下架”，直接中断抓取。这印证了为什么当条目被豆瓣删除后，NeoDB 会完全丧失对该条目的抓取建档能力。
+
+### 5.5 归档导入时的链接优先级调度（`_PREFERRED_SITES`）
+在用户向 NeoDB 导入备份包时，导入器基类 `journal/importers/base.py:get_item_by_info_and_links` 对条目链接执行优先级排序：
+
+```python
+_PREFERRED_SITES = [
+    SiteName.Fediverse,
+    SiteName.RSS,
+    SiteName.TMDB,
+    SiteName.IMDB,
+    SiteName.GoogleBooks,
+    SiteName.Goodreads,
+    SiteName.IGDB,
+]
+```
+
+* `SiteName.Douban` 并不在优先列表中（排序权重为默认的 99）。
+* 导入器按优先级遍历条目提供的全部 `links`：
+  ```python
+  links = [u] + [r["url"] for r in i.get("external_resources") or []]
+  ```
+* **解决墓碑丢条目的关键机理**：
+  如果归档包中仅提供已失效的豆瓣 URL（`https://www.douban.com/game/37364867/`），NeoDB 访问返回 `RESPONSE_CENSORSHIP`，解析失败导致该条目被丢弃；
+  **但只要 Doubak Enricher 在 `external_resources` 中附加上 `https://store.steampowered.com/app/3057160/` 或新重建的豆瓣链接**，NeoDB 就会命中 Steam Scraper 或新豆瓣页面，条目成功被创建并与用户的标记绑定！
+
+### 5.6 条目物理合并语义 (`merge_to`)
+在 `item.py:960` 的 `merge_to` 中，NeoDB 规范了条目合并的标准行为：
+1. `self.merged_to_item = to_item`；
+2. **资源重挂载**：`for res in self.external_resources.all(): res.item = to_item; res.save()`；
+3. **元数据合并与去重**：`uniq(getattr(to_item, k, []) + (v or []))`；
+4. **历史操作平移**：用户指向旧条目的所有 `Mark`、评论与 `ShelfLog` 历史，自动顺着指针归集到合并后的目标条目上。
+
+### 5.7 对 `doubak-data-enricher` 的直接工程启示
+
+| NeoDB 成熟机制 | Doubak Enricher 的吸收与规范对齐 |
+|---|---|
+| **1:N Hub 模型** | `entities.ndjson` 充当抽象 Hub，`douban:game:37364867` 与 `douban:game:33375066` 作为观察 Spoke 挂载其下。 |
+| **`other_lookup_ids` 级联匹配** | Enricher 建立跨站标识字典（`external_ids`），不靠标题模糊匹配，靠公共唯一标识实现自动聚合。 |
+| **`IdealIdTypes` 权威优先级** | 确立以 ISBN、IMDb、Steam AppID、Wikidata QID 为最高权重的证据等级。 |
+| **多链接容灾导入** | 在导出适配器输出的 `catalog.ndjson` 中注入完整的 `external_resources`，彻底根除 NeoDB 导入丢墓碑的问题。 |
+| **`merge_to` 引用重定向** | 投影层（`projection.js`）按聚合实体平移历史时间线，静态站生成别名跳转。 |
+
+---
+
+## 6. 工程实现与质量保证 (Engineering & Verification)
+
+### 6.1 零外部依赖技术选型
 * **原生 HTTP 与自动缓存**：采用 Node.js 原生 `fetch()`，内置 `RequestCache` 模块。每个网络请求必须将完整响应落盘在 `.cache/`，确保二次执行与断网测试 100% 确定性。
 * **限流与防风控**：对 Internet Archive 与 Wikidata 请求施加原生令牌桶限流，请求间隔 ≥ 1.5 秒，智能退避。
 
-### 5.2 确定性测试矩阵 (`npm test`)
+### 6.2 确定性测试矩阵 (`npm test`)
 必须实现以下自动化测试：
 1. **`tombstone-37364867.test.js`**：针对真实的墓碑条目 `37364867`，在 Mock/Cache 环境下验证其标题成功恢复为《情感反诈模拟器》，并成功提取 Steam AppID `3057160`。
 2. **`entity-alignment-33375066.test.js`**：验证 `37364867`（旧）与 `33375066`（新）基于真实捕获的关键词证据与 Steam ID 证据成功对齐，下游投影时间线完整融汇 2025 年与 2026 年两次标记。
@@ -402,18 +538,18 @@ CLAUDE.md 明确定规：“*The parser must not guess a language tag. Douban's 
 
 ---
 
-## 6. 实施路线图 (Milestones & Roadmap)
+## 7. 实施路线图 (Milestones & Roadmap)
 
 | 阶段 | 交付目标 | 核心工作内容 |
 |---|---|---|
-| **Phase 1** | **基础框架与实体对齐 (Entity Alignment Core)** | 搭建 `doubak-data-enricher` 基础框架、CLI 入口、基于证据链的 `entities.ndjson` 聚类模型。 |
+| **Phase 1** | **基础框架与实体对齐 (Entity Alignment Core)** | 搭建 `doubak-data-enricher` 基础框架、CLI 入口、基于证据链的 `entities.ndjson` 聚类模型（对齐 NeoDB 1:N 架构）。 |
 | **Phase 2** | **元信息提取器与语言标注 (RawMeta & Lang Detector)** | 实现针对游戏/电影/图书/音乐的 `raw_meta` 启发式规则提取器与零依赖 CJK 语言判定器。 |
 | **Phase 3** | **Wayback 快照与外部 ID 反查 (Automated Tombstone Recovery)** | 实现 Wayback Machine CDX API 客户端与 Wikidata SPARQL 客户端；以 `37364867` 墓碑为基准跑通恢复。 |
 | **Phase 4** | **垂直领域知识库对接 (Domain Knowledge Bases)** | 接入 Steam Storefront API 与 TMDB API，本地固化海报字节。 |
-| **Phase 5** | **下游流水线贯通 (Downstream Integration & E2E)** | 升级 `doubak-site-generator` 与 `doubak-export-adapters`，实现针对 `37364867` ⟷ `33375066` 的全链路平滑合并渲染。 |
+| **Phase 5** | **下游流水线贯通 (Downstream Integration & E2E)** | 升级 `doubak-site-generator` 与 `doubak-export-adapters`，实现针对 `37364867` ⟷ `33375066` 的全链路平滑合并渲染，并在 NeoDB 导入中实测验证多链接容灾。 |
 
 ---
 
-## 7. 结语
+## 8. 结语
 
 `doubak-data-enricher` 坚决拒绝主观的人工数据篡改，而是依靠历史档案快照、全球公共知识图谱与客观证据链，为每一个被平台审查删除或异名重建的作品找回属于它的真实身份，守护数字时代里每一个普通人不可磨灭的文化足迹。
