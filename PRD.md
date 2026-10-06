@@ -40,7 +40,7 @@
 4. **缺乏全球实体对齐与语言标注**：豆瓣的「又名」未标注语言（简/繁/粤/英/日/韩）；缺乏国际公认唯一标识（Wikidata QID、IMDb tt、Steam AppID、ISBN、MusicBrainz MBID），限制了向分布式社交网络与第三方平台的迁移质量。
 
 ### 0.3 核心设计铁律 (Architectural Invariants)
-本仓库的架构与工程设计必须无条件恪守以下六条铁律：
+本仓库的架构与工程设计必须无条件恪守以下七条铁律：
 
 1. **客观事实与派生缓存分离 (Immutable Facts vs. Derived Cache)**  
    WARC 原始捕获与用户标记是不可撼动的客观事实；`canonical` 是客观观测事件日志。Enricher 产出的所有外部 ID、推断元数据及恢复信息**纯属衍生缓存（Derived Cache）**。清空 Enricher 产出，整个系统依靠原始捕获依然能离线全量构建。
@@ -50,9 +50,11 @@
    外部知识库接口均有严格限流与速率控制。系统绝不盲目线性遍历几千条作品，而是**强制实行优先级队列**：优先调度上游已删除的墓碑条目与残缺条目，且 P0 墓碑处理完毕后立即固化落盘。即便任务中途因网络中断或被用户终止，最关键的丢失条目已经成功恢复。
 4. **绝不允许主观手填元数据，一切增强必须基于可信证据链 (No Manual Metadata Injection)**  
    严禁提供主观手工篡改标题、海报、年份等元数据的后门。手填元数据不仅无法保证真实性，还会引入不可维护的第二混乱真相源。Enricher 的所有数据补充，**必须来自有据可查、可重复验证的公开源**（历史抓取快照、Wayback Machine、Wikidata、Steam、TMDB、Bangumi 等），所有原始网络报文完整存入包内的标准 WARC 文件中封存。
-5. **构建与渲染阶段绝不发起网络请求 (Zero Network at Build/Render Time)**  
+5. **本体粒度与实体对齐防过合并 (Ontological Granularity & Anti-False-Merge Invariant)**  
+   外部标识与豆瓣条目并非天然 1:1 双向单射，现实中存在广泛的 1:N（母包/全集包含多分篇/分卷）、N:1（多发行版本对应单一条目）、N:M（大版本更新/跨平台交叉）等复杂粒度。**外部资源标识关联（External Resource Association）绝不等于同一性实体合并（Entity Fusion）**。系统必须严格区分 `exact_match`、`part_of`、`has_part`、`edition_of` 与 `series_of` 等语义关系，设立严格的防过合并卫哨（Anti-False-Merge Guards），坚决禁止将不同分篇（如《媚娘篇》与《女帝篇》）粗暴吞并为一个实体，捍卫用户独立标记、评语与评分的纯粹性。
+6. **构建与渲染阶段绝不发起网络请求 (Zero Network at Build/Render Time)**  
    Enricher 是整个流水线中**唯一**被允许发起外部网络请求的组件。一旦抓取完成，所有关联结果及网络原始响应必须**固化落盘在包内**。静态站点生成（`site-generator`）与向第三方导出（`export-adapters`）必须永远保持 100% 离线运行。
-6. **极简审计性与零运行时依赖 (Zero Runtime Dependencies)**  
+7. **极简审计性与零运行时依赖 (Zero Runtime Dependencies)**  
    遵循 Doubak monorepo 统一工具链：Node ≥ 20，纯原生 ES 模块（ESM），JSDoc 类型标注，`node:test` 单测框架，零第三方 npm 运行时依赖，零构建步骤。
 
 ---
@@ -97,7 +99,38 @@
   2. **静态站点上的分裂体验**：若无 Enricher，站点会生成两个孤立页面 —— `game/37364867.html`（叫“未知作品”，带着 2025 年的旧短评）与 `game/33375066.html`（叫“捞女游戏”，带着 2026 年的吐槽），历史脉络彻底断裂。
   3. **导出适配器上的残缺**：向 NeoDB 导出时，旧标记 `37364867` 因上游 URL 为 null 只能被抛弃在 `neodb-needs-check.csv`，而新标记 `33375066` 缺乏 2025 年那段完整的历史演进。
 
+### 1.2 多对多与分篇大版本基准案例：从《媚娘篇》到《女帝篇》
+
+除了 1:1 的作品改名与删帖重建，现实中更普遍且更容易引发灾难性“过合并（False / Over-Merge）”的是**多对多（N:M）与分篇大版本（1:N）**的粒度不对称现象：
+
+* **背景**：互动叙事权谋游戏《女王的游戏：盛世天下》（英文名：*Road to Empress* 系列）。
+* **用户归档中的真实客观观测**：
+  在用户的真实标记库（`doubak-bundle-20261006T221030Z-e8a36c`）中，存在两个由豆瓣分别建目的活跃作品：
+  1. **条目 A (`game/37516413`)**：《女王的游戏：盛世天下 媚娘篇》
+     * 标记状态：`done`（已玩过）
+     * 用户评分：5 星（★5）
+     * 真实评语：*“之前玩《隐形守护者》就觉得制作精良，这次《盛世天下》依然是无出其右。很精彩的宫斗~”*
+     * 标签：`["2025", "中国", "宫斗", "剧情", "互动电影"]`
+  2. **条目 B (`game/38487577`)**：《女王的游戏：盛世天下 女帝篇》
+     * 标记状态：`doing`（在玩中）
+     * 用户评分：`null`（未评分）
+     * 真实评语：*“老婆偷偷买了这个游戏，正好我也有借口玩一下 🤭 先从新世界线支线玩起吧。豆瓣的条目建的真的是杂乱啊”*
+* **现实世界中不同平台的粒度割裂**：
+  * **在部分聚合平台与分发商处**：《盛世天下》曾作为一个单一整体游戏（单个 Store Entry / Package / TapTap 聚合页面）存在，两部内容被视为主程序内的两个重大版本更新、前后两章或季票；
+  * **在 Steam 商店中**：官方既有系列合集/捆绑包（Franchise Bundle），也分别建立了两个独立的 Store AppID（媚娘篇 `3478050` 与女帝篇 `4148240`）；
+  * **在豆瓣平台中**：条目建得极为碎片化，用户自己都在短评里感叹“*豆瓣的条目建的真的是杂乱啊*”，但用户在心智上**明确且独立地分别标记了这两部分**（一部通关打了五星，一部正在玩）。
+* **更多领域的类似普遍现象**：
+  * **章节型与 DLC 游戏**：Steam 仅销售单一季票（如《行尸走肉》《奇异人生》），而豆瓣拥有 Episode 1 到 Episode 5 共 5 个独立条目；豆瓣为《巫师3：石之心》《血与酒》建立了独立游戏条目，而在很多外部平台仅作为本体的子 DLC；
+  * **分卷图书与漫画**：豆瓣拥有《三体》单行本 1~3 与全集共 4 个条目；拥有漫画单行本第 1 卷到第 34 卷，以及全集 Boxset；
+  * **影视多季与剧场版**：豆瓣按季（Season 1~8）独立建目，而外部主条目往往仅有一个 Series ID（如 IMDb tt0944947）。
+* **灾难性误区：过合并（False / Over-Merge）**：
+  * 如果系统天真地假设“外部全球唯一标识相同 = 属于完全同一作品 (`same_as`)”，一旦外部来源给出的 ID 是母合集包 ID（Package ID 或单一 Franchise ID），系统就会误将《媚娘篇》与《女帝篇》暴力合并为一个实体！
+  * **合并后果**：媚娘篇的 5 星满分与女帝篇的“未评分/在玩”发生严重数据冲撞，一条评语覆盖另一条评语，彻底破坏了用户对这两个独立篇章的标记记录！
+* **架构设计诉求**：
+  Enricher 必须明确区分**外部资源标识关联（Association）**与**同一性实体合并（Fusion）**。建立 `exact_match`、`part_of`、`has_part`、`edition_of` 与 `series_of` 丰富的语义基数模型，并设立严格的防过合并卫哨（Anti-False-Merge Guards）！
+
 ---
+
 
 ## 2. 系统功能规范 (Functional Specifications)
 
@@ -186,57 +219,158 @@ doubak-enrich <canonical> [out] --priority=P0,P1,P2
 
 ---
 
-### 2.3 模块三：基于证据的实体对齐与条目合并 (Evidence-based Entity Alignment)
+### 2.3 模块三：基于证据的实体对齐与语义关系治理 (Evidence-based Entity Alignment & Ontology Governance)
 
-针对豆瓣上游“删除后换 ID 重建”的问题，Enricher 建立独立的实体对齐层，**不修改 canonical 历史，而是在上层产出聚合映射 (`entities.ndjson`)**。
+针对豆瓣上游“删除后换 ID 重建”、以及“大版本更新/分卷分篇多条目”等错综复杂的现实情况，Enricher 建立独立的实体治理层，**绝不修改 canonical 历史，而是在上层产出关系投影 (`entities.ndjson`)**。
 
-#### 2.3.1 自动对齐的四大证据准则 (Zero-Guesswork Alignment Rules)
-为了杜绝误合并，两个豆瓣条目（如 `37364867` 与 `33375066`）被判定为同一现实作品，必须满足以下**至少一条可信证据**：
+#### 2.3.1 核心解耦：外部标识关联 (Association) $\neq$ 同一性实体合并 (Fusion)
+传统知识库工程最容易陷入的致命陷阱，是将“获取到相同的外部全局标识”等同于“两者在逻辑上属于同一作品 (`same_as`)”。
+然而，现实世界中外部标识与豆瓣条目的映射关系绝非简单的 1:1 单射，而是存在丰富的多对多（N:M）与包含关系：
+* **外部资源标识关联（External Resource Association）**：
+  为豆瓣条目关联 Steam AppID、Wikidata QID、IMDb tt、ISBN 等外部锚点。它的职责是**超链接引用、元数据补全、背景知识拓展与封面字节下载**。无论基数是 1:1、1:N 还是 N:M，只要存在确凿的父子或引用关系，关联即可建立。
+* **同一性实体合并（Entity Fusion）**：
+  将两个或多个豆瓣条目断言为**同一现实作品的同一形态**，并在下游投影（`doubak-site-generator`）与数据导出（`doubak-export-adapters`）中触发打分与评语的聚合折叠。
+* **铁律约束**：**关联绝不自动触发合并！** 只有满足严格的同一性判定、且通过全套防过合并卫哨检验的条目，才允许执行实体合并。
 
-1. **证据 A：外部全球唯一标识一致（Strong External ID Identity）**  
-   * 两个条目经知识库检索后，对应相同的国际公认标识（如拥有完全相同的 Steam AppID `3057160`，或相同的 ISBN、IMDb ID、Wikidata QID）。
-2. **证据 B：上游详情页的别名/关键词强包含（Upstream Metadata Keyword Link）**  
-   * 新条目的页面元数据中明确载有旧条目的名称。  
-   * **实测案例**：在 `game/33375066` 的真实详情页中，`<meta name="keywords">` 显式记录了 `情感反诈模拟器`（正是旧条目 `37364867` 的原名），这构成了上游平台自身提供的强关联证明！
-3. **证据 C：短链接溯源闭环（Short URL Redirection Closure）**  
-   * 旧广播中的短链接跳转或历史网页中的重定向关系形成闭环。
-4. **证据 D：用户第一人称言论的上下文佐证（User Mark Semantic Evidence）**  
-   * 当用户在新条目的标记评语中明确陈述：“*我很确定以前还叫《情感反诈模拟器》的时候就标记过，豆瓣删条目又重建条目了*”，系统通过命名实体与时间轴比对，将此作为辅助判定凭证。
+#### 2.3.2 映射基数与语义关系分类 (Semantic Relation Typology)
+借鉴 W3C SKOS（Simple Knowledge Organization System）与 FRBR 书目记录功能需求，Enricher 显式支持五种语义关系：
 
-#### 2.3.2 实体对齐产物模型 (`entities.ndjson`)
-当对齐成立时，生成规范实体记录：
+| 语义关系取值 | 映射基数 | 关系本质与现实映射 | 示例 | 是否允许自动合并实体 |
+|---|---|---|---|---|
+| **`exact_match`** | 1:1 | **严格同一作品的同一形态**（平台删帖重建或 1:1 对应） | 《情感反诈模拟器》(`37364867`, 墓碑) ⟷ 《捞女游戏》(`33375066`, 活跃) ⟷ Steam `3057160` | **允许**（需通过墓碑重建双重检验） |
+| **`part_of`** | N:1 | **子篇、分卷、分季、DLC 归属于母包/整体** | 《盛世天下 媚娘篇》(`37516413`) `part_of` Steam 盛世天下合集包；《三体 1》`part_of` 三体全集 | **严禁合并**（保持独立实体） |
+| **`has_part`** | 1:N | **母包、合辑、全集包含子部分** | Steam 《Road to Empress Collection》 `has_part` 媚娘篇与女帝篇 | **严禁合并**（声明层级容器） |
+| **`edition_of`** | N:1 | **版本变体**（导剪版、完全版、重制版、平台移植） | 《最后生还者 重制版》 `edition_of` 《最后生还者 原版》 | **严禁合并**（保留各自版本标记） |
+| **`series_of`** | N:N | **同系列/同宇宙延续** | 《盛世天下 媚娘篇》与《盛世天下 女帝篇》互为 `series_of` | **严禁合并**（提供系列导航） |
+
+#### 2.3.3 防过合并（Anti-False-Merge）四层防御卫哨
+为了彻底防止《媚娘篇》与《女帝篇》等分篇、分季作品因共享外部母 ID 而被错误吞并，系统设立四道确定性的防御卫哨：
+
+```
+                           [输入待比对条目对 A 与 B]
+                                       │
+                                       ▼
+             ┌──────────────────────────────────────────────────┐
+             │ 卫哨 1: 双活条目存活阻断 (Both-Active Guard)       │
+             │ A 与 B 是否均为豆瓣正常存活状态 (upstream_deleted: false)? │
+             └──────────────────────────────────────────────────┘
+                            │ 是                   │ 否 (含墓碑)
+                            ▼                      ▼
+             ┌─────────────────────────┐  ┌──────────────────────────────────┐
+             │ 🛑 物理阻断合并！        │  │ 卫哨 2: 篇章与副标题分词阻断      │
+             │ 保持各自独立实体        │  │ 是否包含互斥篇章词 (媚娘 vs 女帝)? │
+             └─────────────────────────┘  └──────────────────────────────────┘
+                                                    │ 是           │ 否
+                                                    ▼              ▼
+                                      ┌──────────────────┐  ┌──────────────────────────────────┐
+                                      │ 🛑 物理阻断合并！ │  │ 卫哨 3: 用户标记共存与评分保护   │
+                                      │ 判定为 part_of   │  │ 用户是否分别标记了两者且状态共存? │
+                                      └──────────────────┘  └──────────────────────────────────┘
+                                                                   │ 是           │ 否
+                                                                   ▼              ▼
+                                                     ┌──────────────────┐  ┌──────────────────────────────────┐
+                                                     │ 🛑 物理阻断合并！ │  │ 卫哨 4: 外部 ID 反向基数判定     │
+                                                     │ 尊重用户独立心智 │  │ 该外部 ID 是否被 >1 个条目引用?   │
+                                                     └──────────────────┘  └──────────────────────────────────┘
+                                                                                  │ 是 (>1)      │ 否 (仅 1:1)
+                                                                                  ▼              ▼
+                                                                    ┌──────────────────┐  ┌─────────────────────────┐
+                                                                    │ 降级为母包/系列  │  │ ✅ 允许执行同一性合并   │
+                                                                    │ 关联，阻断合并   │  │ (exact_match 熔断通过)  │
+                                                                    └──────────────────┘  └─────────────────────────┘
+```
+
+1. **卫哨 1：双活条目存活阻断 (Both-Active Survival Guard)**  
+   * **判据**：若两个条目均处于 `upstream_deleted == false`（均为正常存活），**物理阻断自动合并**。
+   * **原理**：豆瓣目录由数万名资深用户与巡查员共同维护。若两个条目均长期存活且未被合并，证明上游平台明确认定其为两个独立条目。系统绝不自作主张越俎代庖。
+2. **卫哨 2：篇章与副标题分词互斥阻断 (Sub-title / Chapter Tokenizer Guard)**  
+   * **判据**：内置零依赖形态分析器，检测标题中的结构化篇章修饰词：
+     * 游戏/互动剧：`媚娘篇` vs `女帝篇`，`前篇` vs `后篇`，`Episode \d+`，`Chapter \d+`，`DLC`，`资料片`；
+     * 影视：`第\d+季`，`Season \d+`，`剧场版`，`SP`，`特别篇`；
+     * 图书：`第\d+卷`，`Vol\.?\s*\d+`，`上[册本]?` vs `下[册本]?`。
+   * **执行**：一旦命中互斥词组，强制判定为 `part_of` 或 `series_of`，**绝对阻断同一性合并**。
+3. **卫哨 3：用户标记独立共存与评分冲突保护 (Mark Coexistence & Conflict Guard)**  
+   * **判据**：检索 `marks.ndjson` 中用户的真实标记。若用户分别对两个条目留有记录（例如：对 `37516413` 标记 `done ★5`，对 `38487577` 标记 `doing`）：
+   * **执行**：客观证明在用户心智模型中，这是两段独立的游玩/阅读历程。**系统绝对捍卫用户标记边界，禁止将其折叠覆盖！**
+4. **卫哨 4：外部 ID 反向基数推导 (Reverse Cardinality Check)**  
+   * **判据**：当某个外部 ID（如 Steam AppID / Franchise ID）在整个用户库中被引用计数 $> 1$ 时；
+   * **执行**：该外部 ID 自动降级为“母体/系列标识”，不再具备单射权威，阻止任何下游合并。
+
+#### 2.3.4 真实判定对比矩阵：墓碑重开 vs 大版本分篇
+
+| 判定维度 | 基准案例一：《情感反诈》 ⟷ 《捞女游戏》 | 基准案例二：《盛世天下 媚娘篇》 ⟷ 《女帝篇》 |
+|---|---|---|
+| **上游状态** | 一死一生（`37364867` 为墓碑，`33375066` 为活跃） | **双活**（`37516413` 与 `38487577` 均正常存活） |
+| **标题语义** | 完全改名（详情页 keywords 显式包含旧名） | **篇章互斥**（明确区分为“媚娘篇”与“女帝篇”） |
+| **用户标记** | 时间线前后继起（2025 年玩过，2026 年重开吐槽） | **同时并存**（媚娘篇已玩 ★5，女帝篇在玩中） |
+| **外部资源** | Steam AppID `3057160` (1:1 独立游戏) | Steam 分篇 AppID (`3478050` / `4148240`) / 共享系列 Franchise |
+| **卫哨检验结果** | 卫哨 1~4 全数通过 | **触发卫哨 1（双活）、卫哨 2（篇章互斥）、卫哨 3（共存保护）** |
+| **最终处理决策** | **`exact_match` $\to$ 执行实体合并与时间线融汇** | **`series_of` / `part_of` $\to$ 保持独立实体，生成系列关联** |
+
+#### 2.3.5 实体对齐产物模型 (`entities.ndjson`)
+根据上述决策，`entities.ndjson` 同时支持单一实体、融汇实体与系列层级实体：
 
 ```jsonc
+// 1. 墓碑融汇实体 (Fused Entity)
 {
   "entity_id": "entity:game:revenge-on-gold-diggers",
-  "primary_subject_id": "33375066", // 优先使用当前存活活跃的条目 ID
+  "entity_type": "fused",
+  "primary_subject_id": "33375066",
   "display_title": "捞女游戏 Revenge on Gold Diggers",
   "members": [
-    {
-      "medium": "game",
-      "subject_id": "37364867",
-      "status": "tombstone",
-      "evidence": "keywords_match:情感反诈模拟器"
-    },
-    {
-      "medium": "game",
-      "subject_id": "33375066",
-      "status": "active",
-      "evidence": "upstream_current"
-    }
+    { "medium": "game", "subject_id": "37364867", "status": "tombstone", "relation": "exact_match", "evidence": "keywords_match:情感反诈模拟器" },
+    { "medium": "game", "subject_id": "33375066", "status": "active", "relation": "exact_match", "evidence": "upstream_current" }
   ],
   "same_as": [
     "https://www.douban.com/game/37364867/",
     "https://www.douban.com/game/33375066/",
     "https://store.steampowered.com/app/3057160/"
   ],
-  "external_ids": {
-    "steam": "3057160"
-  },
   "alignment_rule": "external_id_and_keyword_match",
   "confidence": 0.99
 }
+
+// 2. 篇章独立实体：媚娘篇 (Singleton Part Entity)
+{
+  "entity_id": "entity:game:road-to-empress-mei-niang",
+  "entity_type": "singleton",
+  "primary_subject_id": "37516413",
+  "display_title": "女王的游戏：盛世天下 媚娘篇",
+  "members": [
+    { "medium": "game", "subject_id": "37516413", "status": "active", "relation": "exact_match", "evidence": "upstream_current" }
+  ],
+  "series": {
+    "series_id": "series:game:road-to-empress",
+    "series_title": "女王的游戏：盛世天下",
+    "part_label": "媚娘篇",
+    "part_index": 1
+  },
+  "external_resources": [
+    { "source": "steam", "id": "3478050", "relation": "exact_match", "url": "https://store.steampowered.com/app/3478050/" }
+  ]
+}
+
+// 3. 篇章独立实体：女帝篇 (Singleton Part Entity)
+{
+  "entity_id": "entity:game:road-to-empress-nv-di",
+  "entity_type": "singleton",
+  "primary_subject_id": "38487577",
+  "display_title": "女王的游戏：盛世天下 女帝篇",
+  "members": [
+    { "medium": "game", "subject_id": "38487577", "status": "active", "relation": "exact_match", "evidence": "upstream_current" }
+  ],
+  "series": {
+    "series_id": "series:game:road-to-empress",
+    "series_title": "女王的游戏：盛世天下",
+    "part_label": "女帝篇",
+    "part_index": 2
+  },
+  "external_resources": [
+    { "source": "steam", "id": "4148240", "relation": "exact_match", "url": "https://store.steampowered.com/app/4148240/" }
+  ]
+}
 ```
+
 
 ---
 
@@ -348,7 +482,25 @@ doubak-enrichment-<enrichment_id>/
     }
   ],
 
-  // 全球通用外部唯一标识
+  // 全球通用外部唯一标识与资源关联
+  "external_resources": [
+    {
+      "source": "steam",
+      "id": "3057160",
+      "url": "https://store.steampowered.com/app/3057160/",
+      "relation": "exact_match", // exact_match | part_of | has_part | edition_of | series_of
+      "part_label": null,
+      "confidence": 0.98
+    },
+    {
+      "source": "wikidata",
+      "id": "Q131920199",
+      "url": "https://www.wikidata.org/wiki/Q131920199",
+      "relation": "exact_match",
+      "part_label": null,
+      "confidence": 0.90
+    }
+  ],
   "external_ids": {
     "wikidata": "Q131920199",
     "steam": "3057160",
@@ -409,6 +561,7 @@ doubak-enrichment-<enrichment_id>/
   * 词表注册表：
     * `vocabularies/enrichment-source.json`（白名单枚举：`local_archive`, `wayback`, `wikidata`, `steam`, `tmdb` 等）；
     * `vocabularies/alignment-rule.json`（对齐规则枚举：`external_id_match`, `keyword_match` 等）；
+    * `vocabularies/semantic-relation.json`（语义关系枚举：`exact_match`, `part_of`, `has_part`, `edition_of`, `series_of`, `shares_external_id`）；
   * 零依赖校验器：`enrichment/v1/validate.py <归档包路径>`。
 
 ### 4.2 `bundle/v1/` 词表的兼容性扩展
@@ -441,17 +594,20 @@ doubak-enrichment-<enrichment_id>/
   ```
 * 若未传递 `--enrichment`，系统严格保持现有降级行为运行。
 * `projection.js` 在加载 Enricher 产出后：
-  1. `mergeReMarks` 按 `entity_id` 聚合，跨 ID 重建作品（如 `37364867` 与 `33375066`）的标记与广播自动合并；
+  1. `mergeReMarks` 按 `entity_id` 聚合，仅对 `exact_match` 融汇实体（如 `37364867` 与 `33375066`）自动合并标记与广播；
   2. 墓碑作品的 `title` 由恢复出的有效字段填补；
-  3. **封面图片零新代码提取**：直接将 `doubak-enrichment-<id>/` 传入 `images.js`，按原有逻辑提取封存的图片到 `static/covers/`，**绝对不向外网发起请求**；
-  4. `markdown.js` 生成跳转别名，主页面呈现客观对齐依据。
+  3. **分篇与系列独立渲染（防过合并）**：对于标注为 `part_of` 或 `series_of` 的实体（如《盛世天下 媚娘篇》与《女帝篇》），站点生成器**坚决不将其合并折叠**，分别保留独立的作品卡片与详情页（媚娘篇的 ★5 评分与女帝篇的“在玩”状态独立完整保留）。在页面侧边或底部呈现“系列篇章导航”（`所属系列：《盛世天下》 | [媚娘篇 (玩过 ★5)] ⟷ [女帝篇 (在玩)]`）；
+  4. **封面图片零新代码提取**：直接将 `doubak-enrichment-<id>/` 传入 `images.js`，按原有逻辑提取封存的图片到 `static/covers/`，**绝对不向外网发起请求**；
+  5. `markdown.js` 生成跳转别名，主页面呈现客观对齐依据。
 
 ### 5.2 与 `doubak-export-adapters` 的契约
 * 命令行约定：
   ```sh
   node bin/export.js <canonical> [out] [--enrichment <enrichment_bundle_dir>]
   ```
-* 导出至 NeoDB 时，若某条目在豆瓣已是墓碑，但已被 Enricher 对齐至存活的新条目或有效的 Steam/IMDb 外部页面，则使用有效链接输出，**避免被抛弃进 `neodb-needs-check.csv`**。
+* 导出至 NeoDB 时：
+  1. 若某条目在豆瓣已是墓碑，但已被 Enricher 对齐至存活的新条目或有效的 Steam/IMDb 外部页面，则优先使用有效链接输出，**避免被抛弃进 `neodb-needs-check.csv`**；
+  2. **分篇导出防冲撞**：对于 `part_of` 或分卷条目，在导出至 NeoDB 时严格保持独立的 mark/journal 记录。若外部链接指向同一个共享母包，适配器会在 `notes` 评语中显式注入分篇声明（如 `【分篇】媚娘篇`），杜绝向同一个 NeoDB 条目导出时产生静默覆盖冲突。
 
 ---
 
@@ -602,7 +758,8 @@ _PREFERRED_SITES = [
 1. **`priority-queue-scheduling.test.js`**：断言包含墓碑与正常条目的全量归档优先消费 P0 队列，并在 P0 完成后触发提前固化提交（Early Commit）。
 2. **`tombstone-37364867.test.js`**：针对真实的墓碑条目 `37364867`，在 Mock/Cache 环境下验证其标题成功恢复为《情感反诈模拟器》，并成功提取 Steam AppID `3057160`。
 3. **`entity-alignment-33375066.test.js`**：验证 `37364867`（旧）与 `33375066`（新）基于真实捕获的关键词证据与 Steam ID 证据成功对齐，下游投影时间线完整融汇 2025 年与 2026 年两次标记。
-4. **`portable-bundle-verify.test.js`**：对产出的 `doubak-enrichment-<id>` 运行完整性自检，断言 WARC gzip 记录完好、SHA-256 校验通过、且能被现有的 `bundle/v1/validate.py` 校验器成功读取。
+4. **`anti-false-merge-granularity.test.js`**：针对《盛世天下 媚娘篇》(`37516413`) 与 《盛世天下 女帝篇》(`38487577`) 的真实双活数据，断言系统触发“双活阻断”、“篇章分词互斥”与“用户标记独立共存”三大卫哨，坚决禁止将两者合并为同一实体，且正确生成 `series_of` / `part_of` 关联。
+5. **`portable-bundle-verify.test.js`**：对产出的 `doubak-enrichment-<id>` 运行完整性自检，断言 WARC gzip 记录完好、SHA-256 校验通过、且能被现有的 `bundle/v1/validate.py` 校验器成功读取。
 
 ---
 
